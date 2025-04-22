@@ -9,3 +9,6 @@ Symbolic execution based tool for detecting speculative execution vulnerabilitie
 --mount type=bind,src="$(pwd)",target=/workspace \
 -w /workspace \
 angr-spec /bin/bash
+
+## Compiling 
+To compile a c-file from test_sources run command: gcc -fno-pie -no-pie -O0 -o ../test_binaries/output_binary your_file.c
