@@ -3,7 +3,7 @@ Symbolic execution based tool for detecting speculative execution vulnerabilitie
 ## Installation
 ### Docker
 1. Clone the repository
-2. Run the command: docker build -t angr-spec
+2. Run the command: docker build -t angr-spec .
 3. In the repository angr-speculative-pht run the command:  docker run -it \
 --platform=linux/amd64 \
 --mount type=bind,src="$(pwd)",target=/workspace \
