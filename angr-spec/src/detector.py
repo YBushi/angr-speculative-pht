@@ -73,16 +73,45 @@ for case_name in case_names:
     
     # get the address of the secretarray and determine its size
     secret_sym = proj.loader.main_object.get_symbol("secretarray")
-    secretarray_addr = secret_sym.rebased_addr
-    secretarray_size = secret_sym.size
+    secret_addr = secret_sym.rebased_addr
+    secret_size = secret_sym.size
+
+    # get the address of the publicarray and determine its size
+    public_sym = proj.loader.main_object.get_symbol("publicarray")
+    public_addr = public_sym.rebased_addr
+    public_size = public_sym.size
+
+    # read both arrays
+    public_bytes = [proj.loader.memory.load(public_addr + i, 1)[0] for i in range(public_size)]
+    secret_bytes = [proj.loader.memory.load(secret_addr + i, 1)[0] for i in range(secret_size)]
+
+    # turn the lists into a set and find the intersection so we know which secret values are in publicarray
+    public_vals = set(public_bytes)
+    secret_vals = set(secret_bytes)
+    leaky_values = public_vals.intersection(secret_vals)
+    # print(f"These are the leaky values: {leaky_values}")
 
     # put symbolic secret values in secretarray
-    for i in range(secretarray_size):
+    for i in range(secret_size):
         symb = claripy.BVS(f"secret_{i}", 8)
-        state.memory.store(secretarray_addr + i, symb)
+        state.memory.store(secret_addr + i, symb)
     
-    # create a list of secret symbols that we have to check for
-    secret_symbols = {f"secret_{i}" for i in range (secretarray_size)}
+    # create a set of secret symbols that we have to check for
+    secret_symbols = {f"secret_{i}" for i in range (secret_size)}
+
+    # put symbolic secret values in publicarray 
+    for i in range(public_size):
+        val = public_bytes[i]
+
+        # only if the value is secret
+        if isinstance(val, int) and val in leaky_values:
+            # print(f"Adding secret_{val} to public array!")
+            symb = claripy.BVS(f"secret_{val}", 8)
+            state.memory.store(public_addr + i, symb)
+            
+            # add the secret value to the set of secret symbols
+            secret_symbols.add(f"secret_{val}")
+    
 
     # allow angr to pick any possible value, helps with resolving when accessing symbolic memory
     state.memory.read_strategies = [SimConcretizationStrategyAny()]
@@ -154,9 +183,17 @@ for case_name in case_names:
         if not state.globals.get('speculative'):
             return
 
-        # determine whether we have accessed anything from the secret memory 
-        accessed_secret = any(strip_suffix(var) in secret_symbols for var in val.variables)
-        
+        accessed_secret = False
+        taint_vars = state.globals.get("taint_vars", set())
+
+        # determine whether we have accessed any secret value
+        if any(strip_suffix(var) in secret_symbols for var in val.variables):
+            accessed_secret = True
+
+        # determine whether the attacker has accessed memory that contains secret value
+        if is_addr_attacker_controled(addr, taint_vars):
+            accessed_secret = True
+
         # if we have accessed a secret mark as leaky
         if accessed_secret:
             func_name = case_name
@@ -227,6 +264,31 @@ for case_name in case_names:
     # check whether an expression is tainted
     def is_tainted(expr, state):
         return any(var in state.globals["taint_vars"] for var in expr.variables)
+
+    # check whether the address depends on a secret
+    def is_addr_attacker_controled(addr, taint_vars):
+        # check whether the adress is dependent on tainted variable
+        is_attacker_controlled = any(var in taint_vars for var in addr.variables)
+
+        if is_attacker_controlled:
+            # get the concerte address of the state
+            concrete_addr = state.solver.eval(addr, cast_to=int)
+
+            # determine whether we are inside publicarray
+            is_inside_public = (public_addr <= concrete_addr < public_addr + public_size)
+            if is_inside_public:
+                offset = concrete_addr - public_addr
+                byte = public_bytes[offset]
+                # determine whether there is a secret symbol in publicarray
+                is_secret_byte = isinstance(byte, int) and f"secret_{byte}" in secret_symbols
+
+                # publicarray is accessed based on the tainted variable and has a secret value
+                if is_secret_byte:
+                    return True
+        return False
+
+
+
     
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
