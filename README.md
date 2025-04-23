@@ -4,7 +4,7 @@ Symbolic execution based tool for detecting speculative execution vulnerabilitie
 Disclaimer: Parts of this repository were build on work from other sources  
 The angr folder was copied from the memsight Github repository (https://github.com/gleissen/memsightpp/tree/main)  
 The container_setup folder and Dockerfile were copied and modified for this project from memsight Github repository (https://github.com/gleissen/memsightpp/tree/main)  
-The test cases named spectre_test{Number} were created using an LLM. They were created for the sole purpose of development and debugging. Results obtained from these cases will not be presented in the thesis.
+The test cases named spectre_test{Number} were created using an LLM. They were created for the sole purpose of development and debugging. Results obtained from these tests will not be presented in the thesis.
 ## Installation
 ### Docker
 #### Apple Silicon Mac
