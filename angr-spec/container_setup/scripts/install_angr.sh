@@ -13,7 +13,7 @@ workon $venv_name
 # We need this angr version, NOT the one in setup.py (was the main branch during
 # testing apparently)
 
-pip3 install -r /home/memsight/.container_setup/scripts/requirements.txt
+pip3 install -r /home/angr-spec/.container_setup/scripts/requirements.txt
 
 ipython profile create
 
