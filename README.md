@@ -1,5 +1,5 @@
 # angr-speculative-pht
-Symbolic execution based tool for detecting speculative execution vulnerabilities (Spectre-PHT) in binaries developed as part of my Bachelor's Thesis at Vrije Universiteit Amsterdam.
+Symbolic execution based tool for detecting speculative execution vulnerabilities (Spectre-PHT) in binaries developed as part of my Bachelor's Thesis at Vrije Universiteit Amsterdam.  
 Disclaimer: Parts of this repository were build on work from other sources  
 The angr folder was copied from the memsight Github repository (https://github.com/gleissen/memsightpp/tree/main)  
 The container_setup folder and Dockerfile were copied and modified for this project from memsight Github repository (https://github.com/gleissen/memsightpp/tree/main)  
