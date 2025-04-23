@@ -4,6 +4,6 @@
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
-  "postCreateCommand": "apt update && apt install -y python3 python3-pip git gcc make",
+  "postCreateCommand": "python3 -m pip install virtualenv && virtualenv -p python3 ~/.virtualenvs/angr8 && ~/.virtualenvs/angr8/bin/pip install angr==8.19.7.25 claripy",
   "mounts": ["source=${localWorkspaceFolder}/results,target=/workspace/results,type=bind"]
 }
