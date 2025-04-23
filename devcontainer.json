@@ -1,9 +1,13 @@
 {
   "name": "angr-spec",
-  "image": "image": "mcr.microsoft.com/devcontainers/python:3.8-bullseye",
-  "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  "image": "mcr.microsoft.com/devcontainers/python:3.8-bullseye",
+  "features": {},
+  "postCreateCommand": "pip install virtualenv && virtualenv -p python3 ~/.virtualenvs/angr8 && ~/.virtualenvs/angr8/bin/pip install angr==8.19.7.25 claripy",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
   },
-  "postCreateCommand": "python3 -m pip install virtualenv && virtualenv -p python3 ~/.virtualenvs/angr8 && ~/.virtualenvs/angr8/bin/pip install angr==8.19.7.25 claripy",
-  "mounts": ["source=${localWorkspaceFolder}/results,target=/workspace/results,type=bind"]
+  "remoteUser": "vscode"
 }
+
