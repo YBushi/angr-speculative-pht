@@ -6,6 +6,8 @@ import sys
 import re
 from collections import defaultdict
 from angr.concretization_strategies import SimConcretizationStrategyAny
+from angr.concretization_strategies import SimConcretizationStrategyRange
+from symbolic_mem import FullySymbolicMemory
 import logging
 import warnings
 
@@ -26,6 +28,13 @@ specific_case = sys.argv[2] if len(sys.argv) >= 3 else None
 
 # number of instruction that can be executed in a speculative state
 SPECULATIVE_WINDOW = 200
+
+# cap the maximum number of new states that can be forked per step -> prevent state explosion
+MAX_SPECULATIVE_FORKS = 10
+
+# cap the maximum number of active steps
+MAX_TOTAL_ACTIVE = 50
+
 
 # create an angr project from the binary
 proj = angr.Project(binary_path, auto_load_libs=False)
@@ -54,6 +63,7 @@ results = defaultdict(lambda: {
 # run the whole process for every case sequentially
 for case_name in case_names:
     func = cfg.kb.functions.function(name=case_name)
+    fork_counter = 0
 
     # create symbolic input + taint sources
     sym_input = claripy.BVS("input", 72) # 72-bit symbolic input
@@ -67,6 +77,13 @@ for case_name in case_names:
 
     # initialize call (entry) state
     state = proj.factory.call_state(func.addr, idx)
+
+    # rewrite the memory to be fully symbolic
+    state.memory = FullySymbolicMemory(endness=proj.arch.memory_endness)
+    state.memory.set_state(state)
+
+    simgr = proj.factory.simulation_manager(state)
+    simgr.stashes.setdefault('deferred', [])
 
     # create a metadata which tracks tainted variables
     state.globals["taint_vars"] = set(taint_sources)
@@ -95,23 +112,36 @@ for case_name in case_names:
     for i in range(secret_size):
         symb = claripy.BVS(f"secret_{i}", 8)
         state.memory.store(secret_addr + i, symb)
+        taint_sources.add(symb.variables)
     
     # create a set of secret symbols that we have to check for
     secret_symbols = {f"secret_{i}" for i in range (secret_size)}
 
-    # put symbolic secret values in publicarray 
+    # create a set of indexes that were replaced by secret symbolic values
+    secret_indices = set()
+
+    public_array_has_secret = False
     for i in range(public_size):
         val = public_bytes[i]
-
-        # only if the value is secret
         if isinstance(val, int) and val in leaky_values:
-            # print(f"Adding secret_{val} to public array!")
-            symb = claripy.BVS(f"secret_{val}", 8)
-            state.memory.store(public_addr + i, symb)
-            
-            # add the secret value to the set of secret symbols
+            public_array_has_secret = True
+            break
+    '''THEORY: If there is a secret value in publicarray, then I can replace the whole publicarray with secret 
+           symbols. I assume that an attacker can choose idx that will access the secret value. Therefore I can treat
+           the whole publicarray as leaky. Check the correctness of this with Alp!!!'''
+    if public_array_has_secret:
+        for i in range(public_size):
+            symb = claripy.BVS(f"secret_{i}", 8)
+            state.memory.store(state.solver.eval(public_addr + i, cast_to=int), symb)
+            taint_sources.add(symb.variables)
             secret_symbols.add(f"secret_{val}")
-    
+            secret_indices.add(i)
+            mem_check = state.memory.load(state.solver.eval(public_addr + i, cast_to=int), 1, inspect=False)
+    sym_val = state.memory.load(state.solver.eval(public_addr + 0, cast_to=int), 1, inspect=False)
+    print(f"Publicarray[0] = {sym_val}, Variables: {sym_val.variables}")
+
+    state.globals["secret_indices"] = secret_indices
+    state.globals["publicarray_base"] = public_addr 
 
     # allow angr to pick any possible value, helps with resolving when accessing symbolic memory
     state.memory.read_strategies = [SimConcretizationStrategyAny()]
@@ -132,11 +162,12 @@ for case_name in case_names:
     state.solver.timeout = 10000
 
     def on_branch(state):
+        global fork_counter
         # get the branch condition and address for the current state 
         cond = state.inspect.exit_guard
         addr = state.addr
 
-        # continue only if the state wasn't already speculated
+        # # continue only if the state wasn't already speculated
         if cond is None or addr in speculated_branches:
             return
 
@@ -146,15 +177,17 @@ for case_name in case_names:
         # check whether the condition is tainted by attacker input
         is_tainted_branch = any(var in taint_sources for var in cond.variables)
 
-        # don't model speculation unless current condition is both symbolic and tainted
-        if not (is_symbolic and is_tainted_branch):
-            return
+        # # don't model speculation unless current condition is both symbolic and tainted
+        # if not (is_symbolic and is_tainted_branch):
+        #     return
         
         speculated_branches.add(addr)
         func_name = case_name
         
         # fork the current state and mark it as speculative
         speculative_state = state.copy()
+        fork_counter+=1
+        # print(f"Forking! Fork counter: {fork_counter}")
         speculative_state.globals['speculative'] = True
 
         # save the condition and set the speculative flag so the state doesn't get prune
@@ -164,6 +197,9 @@ for case_name in case_names:
 
         results[func_name]["speculative"] = True
         results[func_name]["addrs"].add(speculative_state.addr)
+        if len(simgr.active) > MAX_SPECULATIVE_FORKS:
+            print("⚠️ Too many forks already — deferring others to execute later")
+            simgr.stashes['deferred'].append(speculative_state)
 
         # Replace current state with the speculative fork
         simgr.active.append(speculative_state)
@@ -173,29 +209,43 @@ for case_name in case_names:
         addr = state.inspect.mem_read_address
 
         # get the value being read
-        val = state.inspect.mem_read_expr
+        expr = state.inspect.mem_read_expr
 
         # check whether they exist
-        if addr is None or val is None:
+        if addr is None or expr is None:
             return
 
         # if we are not in a speculative state don't proceed
         if not state.globals.get('speculative'):
             return
+        
+        print(f"🔍 Mem Read Addr: {addr}")
+        print(f"Masked idx variables: {addr.variables}")
 
-        accessed_secret = False
+        leak_detected = False
         taint_vars = state.globals.get("taint_vars", set())
+        if any(var in taint_vars for var in addr.variables):
+            print(f"🔥 Memory address depends on attacker input at {hex(state.addr)}!")
+        else:
+            print(f"❌ Memory address does NOT depend on attacker input at {hex(state.addr)}!")
+
+        # determine whether the address is tainted
+        addr_tainted = any(var in taint_vars for var in addr.variables)
+        if addr_tainted:
+            leak_detected = True
 
         # determine whether we have accessed any secret value
-        if any(strip_suffix(var) in secret_symbols for var in val.variables):
-            accessed_secret = True
+        if any(strip_suffix(var) in secret_symbols for var in expr.variables):
+            leak_detected = True
+            for var in expr.variables:
+                state.globals["taint_vars"].add(var)
 
         # determine whether the attacker has accessed memory that contains secret value
         if is_addr_attacker_controled(addr, taint_vars):
-            accessed_secret = True
+            leak_detected = True
 
         # if we have accessed a secret mark as leaky
-        if accessed_secret:
+        if leak_detected:
             func_name = case_name
             leak_key = (state.addr, str(addr))
 
@@ -211,20 +261,25 @@ for case_name in case_names:
 
         # retrieve the offset of the target register
         reg_offset = state.inspect.reg_write_offset
+
+        # get the tainted variables
+        taint_vars = state.globals.get("taint_vars", set())
         
         # proceed only if the expression includes a tainted value
-        if expr is not None and is_tainted(expr, state):
+        if expr is not None and is_tainted(expr, taint_vars):
             
             # based on the register offset, get the register name
             reg_name = state.arch.translate_register_name(reg_offset, size=8)
 
             # taint the target register
+            print(f"Tainting a new register {reg_name}")
             state.globals["taint_vars"].add(reg_name)
 
             # the expression is tainted, so taint every symbolic variable
             for var in expr.variables:
-                var = strip_suffix(var)
-                state.globals["taint_vars"].add(var)
+                stripped_var = strip_suffix(var)
+                print(f"Adding a new tainted variable: {var}")
+                state.globals["taint_vars"].add(stripped_var)
 
     # function to propagate the speculative flag from parents to successors
     def propagate_speculative_flag(state):
@@ -256,22 +311,52 @@ for case_name in case_names:
             block = proj.factory.block(state.addr)
             speculative_instruction_count += len(block.capstone.insns)
             state.globals["spec_instr_count"] = speculative_instruction_count
+    
+    # determine where the loop counter is stored and taint that register
+    def find_loop_counter(state):
+        block = proj.factory.block(state.addr)
+        for insn in block.capstone.insns:
+            mnemonic = insn.mnemonic
+            operands = insn.op_str
+
+            # detect increment instructions (add, inc)
+            if mnemonic in ['add', 'inc']:
+                print(f"🔍 Found potential loop counter at {hex(insn.address)}: {mnemonic} {operands}")
+                
+                # extract register name from operands (simplified)
+                reg_name = operands.split(",")[0].strip()
+
+                # angr uses lowercase register names
+                reg_name = operands.split(",")[0].strip().lower()
+
+                # if the register is not yet tainted, consider symbolizing or tainting
+                taint_vars = state.globals.get("taint_vars", set())
+                if reg_name not in taint_vars:
+                    print(f"🔥 Automatically tainting loop counter register: {reg_name}")
+                    state.globals["taint_vars"].add(reg_name)
+
+    # determine if the address is tainted
+    def is_tainted(expr, taint_vars):
+        return any(var in taint_vars for var in expr.variables)
 
     # keep only the first secret symbol description
     def strip_suffix(var):
         return "_".join(var.split("_")[:2])
 
-    # check whether an expression is tainted
-    def is_tainted(expr, state):
-        return any(var in state.globals["taint_vars"] for var in expr.variables)
-
     # check whether the address depends on a secret
     def is_addr_attacker_controled(addr, taint_vars):
         # check whether the adress is dependent on tainted variable
-        is_attacker_controlled = any(var in taint_vars for var in addr.variables)
+        try:
+            symbolic_expr = addr
+            symbolic_vars = symbolic_expr.variables
+            is_attacker_controlled = any(var in taint_vars for var in symbolic_vars)
+        except Exception as e:
+            print(f"⚠️ Error checking symbolic vars: {e}")
+            is_attacker_controlled = False
 
         if is_attacker_controlled:
             # get the concerte address of the state
+            # ATTENTION: this will drop symbolic and taint tracking!
             concrete_addr = state.solver.eval(addr, cast_to=int)
 
             # determine whether we are inside publicarray
@@ -286,28 +371,47 @@ for case_name in case_names:
                 if is_secret_byte:
                     return True
         return False
-
-
-
+    
+    def log_state_variables(state, label=""):
+        all_vars = set()
+        for expr in state.solver.constraints:
+            all_vars |= expr.variables
+        print(f"🔁 [{label}] state constraint variables: {all_vars}")
+        if "input_12_72" not in all_vars:
+            print("❌ input_12_72 no longer appears in constraints!")
     
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
+    # state.inspect.b('irsb', when=angr.BP_AFTER, action=find_loop_counter) # triggers after basic block execution
     state.inspect.b('exit', when=angr.BP_BEFORE, action=on_branch) # triggers before a branch or conditional jump
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
     state.inspect.b('reg_write', when=angr.BP_AFTER, action=on_reg_write) # triggers after writing to a register
 
     start_time = time.time()
-    simgr = proj.factory.simulation_manager(state)
     speculative_instruction_count = 0
     steps = 0
-    step_limit = 10000
+    step_limit = 200
+
     # execute while there are active states
     while simgr.active and steps < step_limit:
         # advance all active states
-        simgr.step()
+        try:
+            # if there are too many active states move the ones that are over the capacity to deferred
+            if len(simgr.active) > MAX_TOTAL_ACTIVE:
+                print(f"💥 Trimming active states from {len(simgr.active)} → {MAX_TOTAL_ACTIVE}")
+                simgr.stash(from_stash='active', to_stash='deferred', limit=len(simgr.active) - MAX_TOTAL_ACTIVE)
+            # log_state_variables(simgr.active[0], label=f"step {steps}")
+            simgr.step()
+            addr = state.inspect.mem_read_address
+            if addr is not None and not addr.symbolic:
+                print(f"⚠️ Early concretization detected: addr={addr}")
+        except Exception as e:
+            print(f"❌ simgr.step() crashed: {e}")
+            break
         steps += 1
-
+        for state in simgr.active:
+            arg_val = state.solver.eval(state.regs.rdi)  # assuming idx is passed in rdi (System V calling)
         # for every active speculative state check whether it hasn't exceed the speculative window
         for state in simgr.active:
             if state.globals.get("speculative"):
@@ -322,8 +426,15 @@ for case_name in case_names:
                     from_stash='active',
                     to_stash='pruned'
                 )
+        
+        # once we have run out of active states, move the deferred states to active
+        if not simgr.active and 'deferred' in simgr.stashes and simgr.deferred:
+            print("No more active states! Moving deferred to active!")
+            simgr.move(from_stash='deferred', to_stash='active')
+
     end_time = time.time()
     results[case_name]["Time"] = end_time - start_time
+
 
     # loop for every terminal state
     for state in simgr.deadended:
@@ -336,6 +447,7 @@ for case_name in case_names:
         results[case_name]["I"] = len(static_insns)
         results[case_name]["Iunr"] = total_insns
         try:
+            # ATTENTION: this will drop symbolic and taint tracking!
             concrete_input = state.solver.eval(idx, cast_to=int)
             results[case_name]["inputs"].append(hex(concrete_input))
         except:
