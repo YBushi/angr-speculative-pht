@@ -1,7 +1,7 @@
-ailment==8.19.7.25
+ailment==7.8.9.0
 ana==0.6
-angr==8.19.7.25
-archinfo==8.19.7.25
+angr==7.8.9.0
+archinfo==7.8.9.0
 asttokens==2.4.1
 backcall==0.2.0
 bitarray==2.9.2
@@ -9,8 +9,8 @@ bitstring==4.2.3
 cachetools==5.4.0
 capstone==5.0.2
 cffi==1.17.0
-claripy==8.19.7.25
-cle==8.19.7.25
+claripy==7.8.9.0
+cle==7.8.9.0
 cooldict==1.4
 decorator==5.1.1
 dpkt==1.9.8
@@ -42,7 +42,7 @@ pyelftools==0.31
 pygments==2.18.0
 Pympler==1.1
 PySMT==0.9.6
-pyvex==8.19.7.25
+pyvex==7.8.9.0
 rpyc==6.0.0
 setuptools==44.0.0
 six==1.16.0

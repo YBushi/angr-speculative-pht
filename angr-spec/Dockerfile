@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
   time \
   python3 \
   python3-virtualenvwrapper \
+  python3-venv \
   libgomp1 \
   wget \
   gcc \
@@ -53,5 +54,5 @@ RUN /home/$angr_spec_user/.container_setup/scripts/install_angr.sh
 # RUN /home/$angr_spec_user/.container_setup/scripts/install_pypy.sh
 
 # --- Default entrypoint with bash fallback ---
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]
 CMD []

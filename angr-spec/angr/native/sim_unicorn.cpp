@@ -10,7 +10,6 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
-#include <algorithm>
 
 extern "C" {
 #include <libvex.h>
@@ -48,13 +47,12 @@ typedef enum stop {
 	STOP_SEGFAULT,
 	STOP_ZERO_DIV,
 	STOP_NODECODE,
-	STOP_HLT,
 } stop_t;
 
 typedef struct block_entry {
-	bool try_unicorn;
-	std::unordered_set<uint64_t> used_registers;
-	std::unordered_set<uint64_t> clobbered_registers;
+  bool try_unicorn;
+  std::unordered_set<uint64_t> used_registers;
+  std::unordered_set<uint64_t> clobbered_registers;
 } block_entry_t;
 
 typedef struct CachedPage {
@@ -67,8 +65,8 @@ typedef taint_t PageBitmap[PAGE_SIZE];
 typedef std::map<uint64_t, CachedPage> PageCache;
 typedef std::unordered_map<uint64_t, block_entry_t> BlockCache;
 typedef struct caches {
-	PageCache *page_cache;
-	BlockCache *block_cache;
+  PageCache *page_cache;
+  BlockCache *block_cache;
 } caches_t;
 std::map<uint64_t, caches_t> global_cache;
 
@@ -235,8 +233,8 @@ public:
 
 		// error if pc is 0
 		if (pc == 0) {
-			stop_reason = STOP_ZEROPAGE;
-			return UC_ERR_MAP;
+		  stop_reason = STOP_ZEROPAGE;
+		  return UC_ERR_MAP;
 		}
 
 		uc_err out = uc_emu_start(uc, pc, 0, 0, 0);
@@ -328,7 +326,6 @@ public:
 			// if there are any stop points in the current basic block, then there is no chance
 			// for us to stop in the middle of a block.
 			// since we do not support stopping in the middle of a block.
-
 			auto stop_point = stop_points.lower_bound(current_address);
 			if (stop_point != stop_points.end() && *stop_point < current_address + real_size) {
 				stop(STOP_STOPPOINT);
@@ -460,17 +457,6 @@ public:
 				memset(bitmap, TAINT_NONE, sizeof(PageBitmap));
 			}
 		} else {
-		    // TODO: un-hardcode this address, or at least do this warning from python land
-			if (address == 0x4000) {
-				printf("[sim_unicorn] You've mapped something at 0x4000! "
-					"Please don't do that, I put my GDT there!\n");
-			} else {
-				printf("[sim_unicorn] Something very bad is happening; please investigate. "
-					"Trying to activate the page at %#llx but it's already activated.\n", address);
-				// to the person who sees this error:
-				// you're gonna need to spend some time looking into it.
-				// I'm not 100% sure that this is necessarily a bug condition.
-			}
 			bitmap = it->second;
 		}
 
@@ -523,9 +509,8 @@ public:
 	void set_stops(uint64_t count, uint64_t *stops)
 	{
 		stop_points.clear();
-		for (int i = 0; i < count; i++) {
+		for (int i = 0; i < count; i++)
 			stop_points.insert(stops[i]);
-		}
 	}
 
 	std::pair<uint64_t, size_t> cache_page(uint64_t address, size_t size, char* bytes, uint64_t permissions)
@@ -572,7 +557,12 @@ public:
 		return std::make_pair(address, size);
 	}
 
-    void wipe_page_from_cache(uint64_t address) {
+	void uncache_page(uint64_t address) {
+		if ((address & 0xfff) != 0) {
+			printf("Warning: Address #%" PRIx64 " passed to uncache_page is not aligned\n", address);
+			return;
+		}
+
 		auto page = page_cache->find(address);
 		if (page != page_cache->end()) {
 			//printf("Internal: unmapping %#llx size %#x, result %#x", page->first, page->second.size, uc_mem_unmap(uc, page->first, page->second.size));
@@ -582,39 +572,7 @@ public:
 		} else {
 			//printf("Uh oh! Couldn't find page at %#llx\n", address);
 		}
-    }
-
-    void uncache_pages_touching_region(uint64_t address, uint64_t length) {
-		if ((address & 0xfff) != 0) {
-			printf("Warning: Address #%" PRIx64 " passed to uncache_page is not aligned\n", address);
-			return;
-		}
-
-        std::vector<uint64_t> to_erase;
-        for (auto it = page_cache->begin(); it != page_cache->end(); it++)
-        {
-            // TODO: deal with integer overflow? worst case cache gets completely nuked, do we care?
-            uint64_t overlap_start = std::min(it->first + it->second.size, address + length);
-            uint64_t overlap_end = std::max(it->first, address);
-
-            if (overlap_start <= overlap_end)
-            {
-                to_erase.push_back(it->first);
-            }
-        }
-        for (auto v = to_erase.begin(); v != to_erase.end(); v ++)
-        {
-            wipe_page_from_cache(*v);
-        }
 	}
-
-    void clear_page_cache()
-    {
-        while (!page_cache->empty())
-        {
-            wipe_page_from_cache(page_cache->begin()->first);
-        }
-    }
 
 	bool map_cache(uint64_t address, size_t size) {
 		auto it = page_cache->lower_bound(address);
@@ -871,17 +829,12 @@ public:
 
 			std::unique_ptr<uint8_t[]> instructions(new uint8_t[size]);
 			uc_mem_read(this->uc, address, instructions.get(), size);
-			VEXLiftResult *lift_ret = vex_lift(
-					this->vex_guest, this->vex_archinfo, instructions.get(), address, 99, size, 1, 0, 0, 1, 0
-					);
+			IRSB *the_block = vex_lift(this->vex_guest, this->vex_archinfo, instructions.get(), address, 99, size, 1, 0, 0);
 
-
-			if (lift_ret == NULL) {
+			if (the_block == NULL) {
 				// TODO: how to handle?
 				return false;
 			}
-
-			IRSB *the_block = lift_ret->irsb;
 
 			for (int i = 0; i < the_block->stmts_used; i++) {
 				if (!this->check_stmt(clobbered_registers, used_registers, the_block->tyenv, the_block->stmts[i])) {
@@ -921,7 +874,7 @@ public:
 
 		if (end >= start) {
 			if (bitmap) {
-				for (int i = start; i <= end; i++) {
+				for (int i = start; i <= end; i++)  {
 					if (bitmap[i] & TAINT_SYMBOLIC) {
 						return (address & ~0xFFF) + i;
 					}
@@ -957,7 +910,7 @@ public:
 		int end = (address + size - 1) & 0xFFF;
 		int clean;
 
-		if (end >= start) {
+		if (end >= start)  {
 			if (bitmap) {
 				clean = 0;
 				for (int i = start; i <= end; i++) {
@@ -989,7 +942,7 @@ public:
 			bitmap = page_lookup(address + size - 1);
 			if (bitmap) {
 				clean = 0;
-				for (int i = 0; i <= end; i++) {
+				for (int i = 0; i <=  end; i++)  {
 					if (bitmap[i] == TAINT_DIRTY) {
 						clean |= (1 << i);
 						bitmap[i] = TAINT_DIRTY;
@@ -1087,7 +1040,7 @@ static void hook_mem_read(uc_engine *uc, uc_mem_type type, uint64_t address, int
 
 /*
  * the goal of hooking memory write is to determine the exact
- * positions of dirty bytes to writing chaneges back to angr
+ * positions of dirty bytes to writing chaneges  back to angr
  * state. However if the hook is hit before mapping requested
  * page (as writable), we cannot find the bitmap for this page.
  * In this case, just mark all the position as clean (before
@@ -1320,20 +1273,20 @@ void simunicorn_activate(State *state, uint64_t address, uint64_t length, uint8_
 
 extern "C"
 uint64_t simunicorn_executed_pages(State *state) { // this is HORRIBLE
-	if (state->executed_pages_iterator == NULL) {
-		state->executed_pages_iterator = new std::unordered_set<uint64_t>::iterator;
-		*state->executed_pages_iterator = state->executed_pages.begin();
-	}
+    if (state->executed_pages_iterator == NULL) {
+        state->executed_pages_iterator = new std::unordered_set<uint64_t>::iterator;
+        *state->executed_pages_iterator = state->executed_pages.begin();
+    }
 
-	if (*state->executed_pages_iterator == state->executed_pages.end()) {
-		delete state->executed_pages_iterator;
-		state->executed_pages_iterator = NULL;
-		return -1;
-	}
+    if (*state->executed_pages_iterator == state->executed_pages.end()) {
+        delete state->executed_pages_iterator;
+        state->executed_pages_iterator = NULL;
+        return -1;
+    }
 
-	uint64_t out = **state->executed_pages_iterator;
-	(*state->executed_pages_iterator)++;
-	return out;
+    uint64_t out = **state->executed_pages_iterator;
+    (*state->executed_pages_iterator)++;
+    return out;
 }
 
 //
@@ -1440,13 +1393,8 @@ bool simunicorn_cache_page(State *state, uint64_t address, uint64_t length, char
 }
 
 extern "C"
-void simunicorn_uncache_pages_touching_region(State *state, uint64_t address, uint64_t length) {
-	state->uncache_pages_touching_region(address, length);
-}
-
-extern "C"
-void simunicorn_clear_page_cache(State *state) {
-	state->clear_page_cache();
+void simunicorn_uncache_page(State *state, uint64_t address) {
+	state->uncache_page(address);
 }
 
 // Tracking settings

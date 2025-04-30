@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
+set -e
 
-venv_name=angr8
+venv_name=angr7
 _pwd=$PWD
 cd
-export WORKON_HOME="${HOME}/.virtualenvs"
 
-source /usr/share/virtualenvwrapper/virtualenvwrapper.sh
-mkvirtualenv $venv_name
+python3 -m venv ~/.virtualenvs/$venv_name
+source ~/.virtualenvs/$venv_name/bin/activate
 
-workon $venv_name
+# Install dependencies
+pip install -r /home/angr-spec/.container_setup/scripts/requirements.txt
 
-# We need this angr version, NOT the one in setup.py (was the main branch during
-# testing apparently)
+# ✅ Install your local angr repo as an editable package
+pip install -e /home/angr-spec/angr
 
-pip3 install -r /home/angr-spec/.container_setup/scripts/requirements.txt
-
+# Optional: create ipython profile
 ipython profile create
 
-cd $_pwd
+cd "$_pwd"
