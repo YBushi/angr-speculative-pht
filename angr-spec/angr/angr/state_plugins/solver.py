@@ -13,7 +13,6 @@ from decimal import Decimal
 l = logging.getLogger(name=__name__)
 
 #pylint:disable=unidiomatic-typecheck
-import stats
 
 import os
 
@@ -424,8 +423,8 @@ class SimSolver(SimStatePlugin):
         """
         start_time = time.time()
         ret = self._solver.eval_to_ast(e, n, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
 
@@ -446,8 +445,8 @@ class SimSolver(SimStatePlugin):
         """
         start_time = time.time()
         ret = self._solver.eval(e, n, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
     @concrete_path_scalar
@@ -471,8 +470,8 @@ class SimSolver(SimStatePlugin):
         #     return ar
         start_time = time.time()
         ret = self._solver.max(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
 
@@ -497,8 +496,8 @@ class SimSolver(SimStatePlugin):
         #     return ar
         start_time = time.time()
         ret = self._solver.min(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
 #    @timed_function
@@ -523,8 +522,8 @@ class SimSolver(SimStatePlugin):
         #     return ar
         start_time = time.time()
         ret = self._solver.solution(e, v, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
 
@@ -552,8 +551,8 @@ class SimSolver(SimStatePlugin):
         #     return ar
         start_time = time.time()
         ret = self._solver.is_true(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
     @concrete_path_not_bool
@@ -580,8 +579,8 @@ class SimSolver(SimStatePlugin):
         #     return ar
         start_time = time.time()
         ret = self._solver.is_false(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_eval_time += Decimal(time.time() - start_time)
-        stats.smt_evals += 1
+        # stats.smt_eval_time += Decimal(time.time() - start_time)
+        # stats.smt_evals += 1
         return ret
 
 #    @timed_function
@@ -620,8 +619,8 @@ class SimSolver(SimStatePlugin):
         #         assert ar is True
         #     ret = ar
         ret = self._solver.satisfiable(extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
-        stats.smt_satisfiable_time += Decimal(time.time() - start_time)
-        stats.smt_satisfiable_queries += 1
+        # stats.smt_satisfiable_time += Decimal(time.time() - start_time)
+        # stats.smt_satisfiable_queries += 1
         return ret
 
 #    @timed_function
@@ -842,8 +841,8 @@ class SimSolver(SimStatePlugin):
         if e is None:
             start_time = time.time()
             ret = self._solver.simplify()
-            stats.smt_simplificaton_time += Decimal(time.time() - start_time)
-            stats.smt_simplificatons += 1
+            # stats.smt_simplificaton_time += Decimal(time.time() - start_time)
+            # stats.smt_simplificatons += 1
             return ret
         elif isinstance(e, (int, float, bool)):
             return e
@@ -862,8 +861,8 @@ class SimSolver(SimStatePlugin):
     def _claripy_simplify(self, *args): #pylint:disable=no-self-use
         start_time = time.time()
         ret = claripy.simplify(args[0])
-        stats.smt_simplificaton_time += Decimal(time.time() - start_time)
-        stats.smt_simplificatons += 1
+        # stats.smt_simplificaton_time += Decimal(time.time() - start_time)
+        # stats.smt_simplificatons += 1
         return ret
 
     def variables(self, e): #pylint:disable=no-self-use

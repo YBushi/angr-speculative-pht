@@ -6,7 +6,8 @@ import sys
 import re
 from collections import defaultdict
 from angr.concretization_strategies import SimConcretizationStrategyAny
-from symbolic_mem import FullySymbolicMemory
+print("✅ angr loaded from:", angr.__file__)
+from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
 import logging
 import warnings
 
@@ -72,6 +73,7 @@ for case_name in case_names:
     # rewrite the memory to be fully symbolic
     state.memory = FullySymbolicMemory(endness=proj.arch.memory_endness)
     state.memory.set_state(state)
+    print(f"[DEBUG] memory set to: {type(state.memory)}")
 
     simgr = proj.factory.simulation_manager(state)
     simgr.stashes.setdefault('deferred', [])
