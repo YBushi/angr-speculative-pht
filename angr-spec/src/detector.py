@@ -83,11 +83,14 @@ for case_name in case_names:
     secret_sym = proj.loader.main_object.get_symbol("secretarray")
     secret_addr = secret_sym.rebased_addr
     secret_size = secret_sym.size
+    state.globals["secretarray_base"] = secret_addr
+    state.globals["secretarray_size"] = secret_size
 
    # get the address of the publicarray and determine its size
     public_sym = proj.loader.main_object.get_symbol("publicarray")
     public_addr = public_sym.rebased_addr
     public_size = public_sym.size
+    state.globals["publicarray_size"] = public_size
 
     # put symbolic secret values in secretarray
     for i in range(secret_size):
@@ -160,8 +163,11 @@ for case_name in case_names:
         # if we are not in a speculative state don't proceed
         if not state.globals.get('speculative'):
             return
-
-        leaky = False
+        
+        # if we are reading from secret memory, immediately mark as leaky, no need to check further
+        if is_reading_secret_mem(state, addr):
+            mark_as_leaky(state, addr)
+            return
 
         # get the tainted variables
         taint_vars = state.globals.get("taint_vars", set())
@@ -177,33 +183,27 @@ for case_name in case_names:
 
         # in case any of the 3 conditions above is true, mark as leaky:
         if addr_tainted or expr_tainted or accessed_secret:
-            leaky = True
+            mark_as_leaky(state, addr)
 
-        # if we have a leaky memory_read mark this case as leaky
-        if leaky:
-            leak_key = (state.addr, str(addr))
-
-            # we only have to determine if the function is leaky only once, if it's already leaky just skip
-            if leak_key not in results[case_name]["addrs"]:
-                results[case_name]["addrs"].add(leak_key)
-                state.globals['leakage'] = True
-                results[case_name]["leakage"] = True
-    
     def on_reg_write(state):
         # retrieve the expression that is going to be written to a register
         expr = state.inspect.reg_write_expr
 
+        # check whether the expression exists
+        if expr is None:
+            return
+
         # retrieve the offset of the target register
         reg_offset = state.inspect.reg_write_offset
+
+        # based on the register offset, get the register name
+        reg_name = state.arch.translate_register_name(reg_offset, size=8)
 
         # get the tainted variables
         taint_vars = state.globals.get("taint_vars", set())
         
         # proceed only if the expression includes a tainted value
-        if expr is not None and is_tainted(expr, taint_vars):
-            
-            # based on the register offset, get the register name
-            reg_name = state.arch.translate_register_name(reg_offset, size=8)
+        if is_tainted(expr, taint_vars):
 
             # taint the target register
             state.globals["taint_vars"].add(reg_name)
@@ -247,6 +247,30 @@ for case_name in case_names:
     # determine if the address is tainted
     def is_tainted(expr, taint_vars):
         return any(var in taint_vars for var in expr.variables)
+    
+    def is_reading_secret_mem(state, addr):
+        # retrieve the base address of secretarray and its size
+        secret_base = state.globals.get("secretarray_base")
+        secret_size = state.globals.get("secretarray_size")
+
+        try:
+            # concretize the address and determine if we are reading from a secret memory
+            concrete_addr = state.solver.eval(addr, cast_to=int)
+            if secret_base <= concrete_addr < secret_base + secret_size:
+               return True
+        except Exception as e:
+            print(f"⚠️ Could not concretize address: {e}")
+        return False
+    
+    # mark the state as leaky
+    def mark_as_leaky(state, addr):
+        leak_key = (state.addr, str(addr))
+
+        # we only have to determine if the function is leaky only once, if it's already leaky just skip
+        if leak_key not in results[case_name]["addrs"]:
+            results[case_name]["addrs"].add(leak_key)
+            state.globals['leakage'] = True
+            results[case_name]["leakage"] = True
 
     # keep only the first secret symbol description
     def strip_suffix(var):

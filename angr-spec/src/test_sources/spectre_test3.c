@@ -19,7 +19,7 @@ void case_1(uint64_t idx) {
     }
 }
 
-// ✅ SAFE — conditional but no memory access dependent on secret
+// 🔥 LEAKY
 void case_2(uint64_t idx) {
     if (idx < publicarray_size) {
         if (publicarray[idx] == 42) {
