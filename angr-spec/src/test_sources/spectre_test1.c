@@ -56,7 +56,7 @@ void case_5(uint64_t idx) {
     }
 }
 
-// ✅ safe — secret used in logic, not memory
+// 🔥 LEAKY
 void case_6(uint64_t idx) {
     if (idx < secretarray_size) {
         uint8_t s = secretarray[idx];

@@ -4,12 +4,13 @@ import time
 import csv
 import sys
 import re
+import capstone
 from collections import defaultdict
-from angr.concretization_strategies import SimConcretizationStrategyAny
-print("✅ angr loaded from:", angr.__file__)
 from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
 import logging
 import warnings
+from angr.sim_state import SimState
+from ct_memory import CTMemory
 
 # uncomment only for presenting results!!!
 warnings.filterwarnings("ignore")
@@ -31,6 +32,9 @@ SPECULATIVE_WINDOW = 200
 
 # create an angr project from the binary
 proj = angr.Project(binary_path, auto_load_libs=False)
+
+# create a symbolic memory from memsightpp
+CTMemory._set_memsight_ranges(proj)
 
 # initialize a CFG and map addresses to function names
 cfg = proj.analyses.CFGFast(normalize=True)
@@ -57,6 +61,24 @@ results = defaultdict(lambda: {
 for case_name in case_names:
     func = cfg.kb.functions.function(name=case_name)
 
+    # check whether there is a conditional branch in this case
+    def has_branching(func):
+        for block_addr in func.block_addrs_set:
+            block = proj.factory.block(block_addr)
+            for insn in block.capstone.insns:
+                if capstone.CS_GRP_JUMP in insn.groups:
+                    return True
+        return False
+
+    # if there is not a branch, skip this case
+    if not has_branching(func):
+        results[case_name]["speculative"] = False
+        results[case_name]["leakage"] = False
+        results[case_name]["I"] = 0
+        results[case_name]["Iunr"] = 0
+        results[case_name]["Time"] = 0.0
+        continue
+
     # create symbolic input + taint sources
     sym_input = claripy.BVS("input", 72) # 72-bit symbolic input
     taint_sources = set(sym_input.variables)
@@ -67,16 +89,40 @@ for case_name in case_names:
     idx = sym_input[:64] # actual input
     selector = sym_input[64:] # extra input to differentiate runs
 
+    SimState.register_default('memory', CTMemory)
+
     # initialize call (entry) state
-    state = proj.factory.call_state(func.addr, idx)
+    state = state = proj.factory.call_state(func.addr, idx)
+    block = proj.factory.block(state.addr)
 
     # rewrite the memory to be fully symbolic
-    state.memory = FullySymbolicMemory(endness=proj.arch.memory_endness)
-    state.memory.set_state(state)
-    print(f"[DEBUG] memory set to: {type(state.memory)}")
-
+    ct_mem = CTMemory(endness=proj.arch.memory_endness)
+    ct_mem.set_state(state)
+    state.register_plugin('memory', ct_mem)
+    
+    # create the simulation manager
     simgr = proj.factory.simulation_manager(state)
-    simgr.stashes.setdefault('deferred', [])
+
+    # flags set the same way as in memsightpp
+    # add simulation options
+    state.options.add(angr.sim_options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
+    state.options.add(angr.sim_options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
+    state.options.add(angr.sim_options.CONSERVATIVE_READ_STRATEGY)
+    state.options.add(angr.sim_options.CONSERVATIVE_WRITE_STRATEGY)
+    state.options.add(angr.sim_options.SYMBOLIC_INITIAL_VALUES)
+
+    # remove simplification
+    state.options.discard(angr.options.KEEP_IP_SYMBOLIC)
+    state.options.discard(angr.options.SIMPLIFY_MEMORY_WRITES)
+    state.options.discard(angr.options.SIMPLIFY_REGISTER_WRITES)
+    state.options.discard(angr.options.SIMPLIFY_MEMORY_READS)
+    state.options.discard(angr.options.SIMPLIFY_REGISTER_READS)
+    state.options.discard(angr.options.SIMPLIFY_EXIT_GUARD)
+    state.options.discard(angr.options.SIMPLIFY_EXIT_STATE)
+    state.options.discard(angr.options.SIMPLIFY_EXIT_TARGET)
+    state.options.discard(angr.options.SIMPLIFY_RETS)
+    state.options.discard(angr.options.SIMPLIFY_EXPRS)
+    state.options.discard(angr.options.SIMPLIFY_CONSTRAINTS)
 
     # create a metadata which tracks tainted variables
     state.globals["taint_vars"] = set(taint_sources)
@@ -99,95 +145,95 @@ for case_name in case_names:
         symb = claripy.BVS(f"secret_{i}", 8)
         state.memory.store(secret_addr + i, symb)
     
+    # make public array symbolic
+    for i in range(public_size):
+        public_byte = claripy.BVS(f"public_{i}", 8)
+        state.memory.store(public_addr + i, public_byte)
+
     # create a set of secret symbols that we have to check for
     secret_symbols = {f"secret_{i}" for i in range (secret_size)}
 
-    # allow angr to pick any possible value, helps with resolving when accessing symbolic memory
-    state.memory.read_strategies = [SimConcretizationStrategyAny()]
-    state.memory.write_strategies = [SimConcretizationStrategyAny()]
-
-    # pick any possible value when reading and don't access unmapped memory
-    state.options.add(angr.options.CONSERVATIVE_READ_STRATEGY)
-    state.options.add(angr.options.STRICT_PAGE_ACCESS)
-
-    # returns 0 from uninitialized memory/registers
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS)
-
-    # enable automatic simplification
-    state.options.add(angr.options.SIMPLIFY_EXPRS)
-    
     # set a time limit for solving constraints
-    state.solver.timeout = 10000
+    state.solver.timeout = 1000
 
     def on_branch(state):
-        global fork_counter
-        # get the branch condition and address for the current state 
+        # get the branch condition and address for the current state
         cond = state.inspect.exit_guard
         addr = state.addr
 
-        # # continue only if the state wasn't already speculated
+        # continue only if the state wasn't already speculated 
         if cond is None or addr in speculated_branches:
             return
-        
         speculated_branches.add(addr)
         
         # fork the current state and mark it as speculative
-        speculative_state = state.copy()
-        speculative_state.globals['speculative'] = True
+        speculative = state.copy()
+        speculative.globals["speculative"] = True
 
-        # save the condition and set the speculative flag so the state doesn't get prune
-        # before the condition is retrieved in an irsb hook 
-        state.globals["defer_speculation_cond"] = cond
-        state.globals["speculative"] = True
-
+        # mark the state as not speculative
         results[case_name]["speculative"] = True
-        results[case_name]["addrs"].add(speculative_state.addr)
+        results[case_name]["addrs"].add(speculative.addr)
 
-        # Replace current state with the speculative fork
-        simgr.active.append(speculative_state)
+        # evaluate the condition and set the opposite condition to the speculative state to model misprediction
+        try:
+            if state.solver.eval(cond):
+                state.globals["defer_speculation_cond"] = claripy.Not(cond)
+            else:
+                state.globals["defer_speculation_cond"] = cond
+        except:
+            pass
+        
+        # add the new speculative state to the active states
+        simgr.active.append(speculative)
+
 
     def mem_read(state):
         '''
         On memory read, detect whether we have read a secret symbol value that was put into the secret array during
-        initialization. 
+        initialization
         '''
+        # if we are not in a speculative state don't proceed
+        if not state.globals.get('speculative'):
+            return 
+        
         # get the address from which memory will be read
         addr = state.inspect.mem_read_address
 
         # get the value being read
         expr = state.inspect.mem_read_expr
 
+        # get the tainted variables
+        taint_vars = state.globals.get("taint_vars", set())
+
         # check whether they exist
         if addr is None or expr is None:
             return
 
-        # if we are not in a speculative state don't proceed
-        if not state.globals.get('speculative'):
+        # if we have read a secret, immediately mark as leaky, no need to search further
+        if any(strip_suffix(var) in secret_symbols for var in expr.variables):
+            mark_as_leaky(state, addr)
             return
         
-        # if we are reading from secret memory, immediately mark as leaky, no need to check further
+        # if we are reading from secret memory, immediately mark as leaky, no need to search further
         if is_reading_secret_mem(state, addr):
             mark_as_leaky(state, addr)
             return
-
-        # get the tainted variables
-        taint_vars = state.globals.get("taint_vars", set())
-
-        # determine whether the address is attacker controlled
+        
+        # determine whether the address is tainted
         addr_tainted = any(strip_suffix(var) in taint_vars for var in addr.variables)
 
         # determine whether the expression is tainted   
         expr_tainted = any(strip_suffix(var) in taint_vars for var in expr.variables)
-        
-        # determine whether we have accessed any secret value
-        accessed_secret = any(strip_suffix(var) in secret_symbols for var in expr.variables)
-
-        # in case any of the 3 conditions above is true, mark as leaky:
-        if addr_tainted or expr_tainted or accessed_secret:
+    
+        # in case any of the 2 conditions above is true, mark as leaky:
+        if addr_tainted or expr_tainted:
             mark_as_leaky(state, addr)
 
     def on_reg_write(state):
+        # if we are not in a speculative state don't proceed
+        if not state.globals.get('speculative'):
+            return 
+        
         # retrieve the expression that is going to be written to a register
         expr = state.inspect.reg_write_expr
 
@@ -233,12 +279,8 @@ for case_name in case_names:
         # only inject misprediction if previously flagged
         if "defer_speculation_cond" in state.globals:
             cond = state.globals.pop("defer_speculation_cond")
-            state.add_constraints(state.solver.Not(cond))
+            state.add_constraints(cond)
 
-            # set the flag to false, so this state can be pruned
-            state.globals["speculative"] = False 
-    
-    # after an instruction block, add the number of instruction that were executed to the counter
     def count_speculative_instructions(state):
         if state.globals.get("speculative"):
             speculative_instruction_count = state.globals.get("spec_instr_count", 0)
@@ -251,19 +293,28 @@ for case_name in case_names:
         return any(var in taint_vars for var in expr.variables)
     
     def is_reading_secret_mem(state, addr):
-        # retrieve the base address of secretarray and its size
+        """
+        Check whether we are reading from a secret memory range
+        """
         secret_base = state.globals.get("secretarray_base")
         secret_size = state.globals.get("secretarray_size")
 
+        if secret_base is None or secret_size is None or addr is None:
+            return False
+
         try:
-            # concretize the address and determine if we are reading from a secret memory
-            concrete_addr = state.solver.eval(addr, cast_to=int)
-            if secret_base <= concrete_addr < secret_base + secret_size:
-               return True
+            # build constraint: secret_base <= addr < secret_base + secret_size
+            in_range = state.solver.satisfiable(
+                extra_constraints=[
+                    addr >= secret_base,
+                    addr < secret_base + secret_size
+                ]
+            )
+            return in_range
         except Exception as e:
-            print(f"⚠️ Could not concretize address: {e}")
-        return False
-    
+            print(f"⚠️ Symbolic range check failed: {e}")
+            return False
+        
     # mark the state as leaky
     def mark_as_leaky(state, addr):
         leak_key = (state.addr, str(addr))
@@ -271,20 +322,13 @@ for case_name in case_names:
         # we only have to determine if the function is leaky only once, if it's already leaky just skip
         if leak_key not in results[case_name]["addrs"]:
             results[case_name]["addrs"].add(leak_key)
-            state.globals['leakage'] = True
             results[case_name]["leakage"] = True
+            results[case_name]["speculative"] = state.globals.get("speculative", False)
+            state.globals['leakage'] = True
 
     # keep only the first secret symbol description
     def strip_suffix(var):
         return "_".join(var.split("_")[:2])
-    
-    def log_state_variables(state, label=""):
-        all_vars = set()
-        for expr in state.solver.constraints:
-            all_vars |= expr.variables
-        print(f"🔁 [{label}] state constraint variables: {all_vars}")
-        if "input_12_72" not in all_vars:
-            print("❌ input_12_72 no longer appears in constraints!")
     
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
@@ -295,29 +339,24 @@ for case_name in case_names:
 
     start_time = time.time()
     speculative_instruction_count = 0
-    steps = 0
-    step_limit = 200
 
     # execute while there are active states
-    while simgr.active and steps < step_limit:
+    while simgr.active:
         # advance states
         simgr.step()
-        steps += 1
 
         # for every active speculative state check whether it hasn't exceed the speculative window
         for state in simgr.active:
-            if state.globals.get("speculative"):
-                if state.globals.get("spec_instr_count", 0) >= SPECULATIVE_WINDOW:
+            if state.globals.get("spec_instr_count", 0) >= SPECULATIVE_WINDOW:
                     # if the speculative window has been exceeded, discard the state
-                    simgr.active.remove(state)
+                    state.globals["speculative"] = False
+            if not state.globals.get("speculative", False):
+                simgr.deadended.append(state)
         
-        # if we have already detected a leakage, prune all non-speculative states
+        # if we have already detected a leakage, halt the execution
         if results[case_name]["leakage"]:
-            simgr.stash(
-                    filter_func=lambda s: not s.globals.get("speculative", False),
-                    from_stash='active',
-                    to_stash='pruned'
-                )
+            simgr.deadended.extend(simgr.active)
+            simgr.active.clear()
 
     end_time = time.time()
     results[case_name]["Time"] = end_time - start_time
@@ -333,7 +372,6 @@ for case_name in case_names:
         results[case_name]["I"] = len(static_insns)
         results[case_name]["Iunr"] = total_insns
         try:
-            # ATTENTION: this will drop symbolic and taint tracking!
             concrete_input = state.solver.eval(idx, cast_to=int)
             results[case_name]["inputs"].append(hex(concrete_input))
         except:

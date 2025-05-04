@@ -12,7 +12,7 @@ uint64_t publicarray_size = 16;
 uint64_t publicarray_mask = 15;
 uint64_t secretarray_size = 16;
 
-// ✅ SAFE — bounds check prevents speculative read of secret
+// 🔥 LEAKY
 void case_1(uint64_t idx) {
     if (idx < publicarray_size) {
         temp &= publicarray2[publicarray[idx] * 512];

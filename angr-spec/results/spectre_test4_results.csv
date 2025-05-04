@@ -1,0 +1,9 @@
+Binary,I,Iunr,Time,Result
+case_0,19,20,0.57,Insecure
+case_1,9,10,0.71,Insecure
+case_2,21,22,0.51,Insecure
+case_3,21,22,0.98,Insecure
+case_4,24,25,0.29,Insecure
+case_5,9,10,0.83,Insecure
+case_6,9,10,0.28,Insecure
+spectre_test4,112,119,4.17,Insecure
