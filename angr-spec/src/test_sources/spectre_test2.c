@@ -36,7 +36,7 @@ void case_2(uint64_t idx) {
     // Double indexing: secret controls array access
     if (idx < publicarray_size) {
         uint8_t ptr = secretarray[idx];
-        temp &= publicarray2[publicarray[ptr] * 512];
+        // temp &= publicarray2[publicarray[ptr] * 512];
     }
 }
 

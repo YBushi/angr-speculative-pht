@@ -17,6 +17,12 @@ warnings.filterwarnings("ignore")
 logging.getLogger("angr.state_plugins.symbolic_memory").setLevel(logging.ERROR)
 logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.ERROR)
 
+# suppress warnings from memsight
+logging.getLogger("memsight").setLevel(logging.ERROR)
+
+# suppress angr's unconstrained successor warnings
+logging.getLogger("angr.engines.successors").setLevel(logging.ERROR)
+
 # load the binary and optionally a specific case name
 # if a specific case is not provided, all case_ functions will be run
 if len(sys.argv) < 2:
@@ -165,6 +171,19 @@ for case_name in case_names:
         if cond is None or addr in speculated_branches:
             return
         speculated_branches.add(addr)
+
+        # retrieve the tainted variables
+        taint_vars = state.globals.get("taint_vars", set())
+
+        # get the variables of the condition
+        cond_vars = {strip_suffix(var) for var in cond.variables}
+        # print(f"\n🔍 [on_branch] At PC: {hex(state.addr)}")
+        # print(f"  → Branch Condition: {cond}")
+        # print(f"  → Condition Vars: {cond.variables}")
+        # print(f"  → Tainted Vars: {taint_vars}")
+        # print(f"  → Secret Symbols: {secret_symbols}")
+        # print(f"  → Tainted Intersection: {taint_vars & cond_vars}")
+        # print(f"  → Secret Intersection: {secret_symbols & cond_vars}")
         
         # fork the current state and mark it as speculative
         speculative = state.copy()
@@ -174,14 +193,13 @@ for case_name in case_names:
         results[case_name]["speculative"] = True
         results[case_name]["addrs"].add(speculative.addr)
 
-        # evaluate the condition and set the opposite condition to the speculative state to model misprediction
-        try:
-            if state.solver.eval(cond):
-                state.globals["defer_speculation_cond"] = claripy.Not(cond)
-            else:
-                state.globals["defer_speculation_cond"] = cond
-        except:
-            pass
+        # this is too aggressive, I have to figure out how to check whether the mem_read in here is secret dependent
+        # determine if condition is depend on secret or tainted variables
+        if secret_symbols & cond_vars or taint_vars & cond_vars:
+            mark_as_leaky(speculative, speculative.addr)
+
+        # always take the mispredicted path
+        state.globals["defer_speculation_cond"] = claripy.Not(cond)
         
         # add the new speculative state to the active states
         simgr.active.append(speculative)
@@ -208,25 +226,34 @@ for case_name in case_names:
         # check whether they exist
         if addr is None or expr is None:
             return
+        
+        # print(f"\n🔍 [mem_read] At PC: {hex(state.addr)}")
+        # print(f"  → Read Address Expr: {addr}")
+        # print(f"  → Read Value Expr:   {expr}")
 
-        # if we have read a secret, immediately mark as leaky, no need to search further
+        # print(f"  → Address Vars: {addr.variables}")
+        # print(f"  → Value Vars:   {expr.variables}")
+        # print(f"  → Tainted Vars: {state.globals.get('taint_vars', set())}")
+        # print(f"  → Secret Symbols: {secret_symbols}")
+
+        # if a secret was used to determine the address of memory read, mark as leaky
+        if any(strip_suffix(var) in secret_symbols for var in addr.variables):
+            mark_as_leaky(state, addr)
+        
+        # if we have read a secret, mark all the variables of the read expression as tainted
         if any(strip_suffix(var) in secret_symbols for var in expr.variables):
-            mark_as_leaky(state, addr)
-            return
+            for var in expr.variables:
+                stripped_var = strip_suffix(var)
+                state.globals["taint_vars"].add(stripped_var)
         
-        # if we are reading from secret memory, immediately mark as leaky, no need to search further
-        if is_reading_secret_mem(state, addr):
-            mark_as_leaky(state, addr)
-            return
+        # if the address contains tainted variables, taint all the variables from the read expression 
+        if any(strip_suffix(var) in taint_vars for var in addr.variables):
+            for var in expr.variables:
+                stripped_var = strip_suffix(var)
+                state.globals["taint_vars"].add(stripped_var)
         
-        # determine whether the address is tainted
-        addr_tainted = any(strip_suffix(var) in taint_vars for var in addr.variables)
-
-        # determine whether the expression is tainted   
-        expr_tainted = any(strip_suffix(var) in taint_vars for var in expr.variables)
-    
-        # in case any of the 2 conditions above is true, mark as leaky:
-        if addr_tainted or expr_tainted:
+        # if the address was tainted, mark as leaky
+        if any(strip_suffix(var) in taint_vars for var in addr.variables):
             mark_as_leaky(state, addr)
 
     def on_reg_write(state):
@@ -280,6 +307,11 @@ for case_name in case_names:
         if "defer_speculation_cond" in state.globals:
             cond = state.globals.pop("defer_speculation_cond")
             state.add_constraints(cond)
+            # print(f"\n🧩 [on_irsb] Adding misprediction constraint at {hex(state.addr)}:")
+            # print(f"  → Constraint being added: {cond}")  
+            # print(f"  → Total constraints in path now: {len(state.solver.constraints)}")
+            # for i, c in enumerate(state.solver.constraints):
+            #     print(f"    [{i}] {c}")
 
     def count_speculative_instructions(state):
         if state.globals.get("speculative"):
@@ -291,29 +323,6 @@ for case_name in case_names:
     # determine if the address is tainted
     def is_tainted(expr, taint_vars):
         return any(var in taint_vars for var in expr.variables)
-    
-    def is_reading_secret_mem(state, addr):
-        """
-        Check whether we are reading from a secret memory range
-        """
-        secret_base = state.globals.get("secretarray_base")
-        secret_size = state.globals.get("secretarray_size")
-
-        if secret_base is None or secret_size is None or addr is None:
-            return False
-
-        try:
-            # build constraint: secret_base <= addr < secret_base + secret_size
-            in_range = state.solver.satisfiable(
-                extra_constraints=[
-                    addr >= secret_base,
-                    addr < secret_base + secret_size
-                ]
-            )
-            return in_range
-        except Exception as e:
-            print(f"⚠️ Symbolic range check failed: {e}")
-            return False
         
     # mark the state as leaky
     def mark_as_leaky(state, addr):
@@ -373,7 +382,9 @@ for case_name in case_names:
         results[case_name]["Iunr"] = total_insns
         try:
             concrete_input = state.solver.eval(idx, cast_to=int)
-            results[case_name]["inputs"].append(hex(concrete_input))
+            hex_input = hex(concrete_input)
+            if hex_input not in results[case_name]["inputs"]:
+                results[case_name]["inputs"].append(hex_input)
         except:
             pass
 
