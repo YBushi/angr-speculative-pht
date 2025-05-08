@@ -177,13 +177,6 @@ for case_name in case_names:
 
         # get the variables of the condition
         cond_vars = {strip_suffix(var) for var in cond.variables}
-        # print(f"\n🔍 [on_branch] At PC: {hex(state.addr)}")
-        # print(f"  → Branch Condition: {cond}")
-        # print(f"  → Condition Vars: {cond.variables}")
-        # print(f"  → Tainted Vars: {taint_vars}")
-        # print(f"  → Secret Symbols: {secret_symbols}")
-        # print(f"  → Tainted Intersection: {taint_vars & cond_vars}")
-        # print(f"  → Secret Intersection: {secret_symbols & cond_vars}")
         
         # fork the current state and mark it as speculative
         speculative = state.copy()
@@ -193,10 +186,7 @@ for case_name in case_names:
         results[case_name]["speculative"] = True
         results[case_name]["addrs"].add(speculative.addr)
 
-        # this is too aggressive, I have to figure out how to check whether the mem_read in here is secret dependent
-        # determine if condition is depend on secret or tainted variables
-        if secret_symbols & cond_vars or taint_vars & cond_vars:
-            mark_as_leaky(speculative, speculative.addr)
+        #TODO: in this hook, I have to check whether the condition isn't dependent on a secret or secret-tainted value
 
         # always take the mispredicted path
         state.globals["defer_speculation_cond"] = claripy.Not(cond)
@@ -226,15 +216,6 @@ for case_name in case_names:
         # check whether they exist
         if addr is None or expr is None:
             return
-        
-        # print(f"\n🔍 [mem_read] At PC: {hex(state.addr)}")
-        # print(f"  → Read Address Expr: {addr}")
-        # print(f"  → Read Value Expr:   {expr}")
-
-        # print(f"  → Address Vars: {addr.variables}")
-        # print(f"  → Value Vars:   {expr.variables}")
-        # print(f"  → Tainted Vars: {state.globals.get('taint_vars', set())}")
-        # print(f"  → Secret Symbols: {secret_symbols}")
 
         # if a secret was used to determine the address of memory read, mark as leaky
         if any(strip_suffix(var) in secret_symbols for var in addr.variables):
@@ -301,8 +282,14 @@ for case_name in case_names:
             # initialize taint variables from attacker input
             state.globals["taint_vars"] = set(sym_input.variables)
     
-    # after an instruction block, inject the misprediction to the constraints
-    def on_irsb(state):
+    def inject_constraint(state):
+        '''
+        After a condition branch is resolved an angr goes into the branch, inject the mispredicted constraint
+        '''
+        # only inject misprediction constraint in speculative states
+        if not state.globals.get("speculative", False):
+            return
+
         # only inject misprediction if previously flagged
         if "defer_speculation_cond" in state.globals:
             cond = state.globals.pop("defer_speculation_cond")
@@ -340,7 +327,7 @@ for case_name in case_names:
         return "_".join(var.split("_")[:2])
     
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
-    state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
+    state.inspect.b('exit', when=angr.BP_AFTER, action=inject_constraint) # triggers after branch is resolved
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
     state.inspect.b('exit', when=angr.BP_BEFORE, action=on_branch) # triggers before a branch or conditional jump
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read

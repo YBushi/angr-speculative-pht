@@ -1,6 +1,9 @@
 from angr.storage.memory import SimMemory
 from angr.state_plugins.symbolic_memory import SimSymbolicMemory
 from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
+from angr.errors import SimUnsatError
+import claripy
+
 
 from IPython import embed
 
@@ -119,8 +122,21 @@ class CTMemory(SimMemory):
         return self.mem_memsight._store(req)
 #        return self._memory(req.addr)._store(req)
 
-    def _load(self, addr, size, condition=None, fallback=None, inspect=True, events=True, ret_on_segv=False):
-        return self._memory(addr)._load(addr, size, condition, fallback, inspect, events, ret_on_segv)
+    # def _load(self, addr, size, condition=None, fallback=None, inspect=True, events=True, ret_on_segv=False):
+    #     return self._memory(addr)._load(addr, size, condition, fallback, inspect, events, ret_on_segv)
+    def _load(self, addr, size, condition=None, fallback=None, inspect=None, events=None, ret_on_segv=False):
+        """
+        Perform a memory load, but on unsatisfiable speculative accesses
+        return a concrete zero rather than raising an exception
+        """
+        try:
+            if self.state.solver.unique(addr):
+                return self._memory(addr)._load(addr, size, condition, fallback, inspect, events, ret_on_segv)
+            return self._memory(addr)._load(addr, size, condition, fallback, inspect, events, ret_on_segv)
+        except (SimUnsatError, claripy.errors.UnsatError):
+            # instead of crashing, return a zero‐bitvector of the right size
+            dummy = claripy.BVV(0, size * 8)
+            return addr, dummy, False
 
     def map_region(self, addr, length, permissions):
         self.mem_memsight.mem_region(addr, length, permissions)
