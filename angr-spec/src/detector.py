@@ -92,6 +92,187 @@ def has_branching(func):
                 return True
     return False
 
+def record_branch_count(state):
+        """Record the number of constraints before the conditional branch
+           Save the original exit guard that will then determine which state is speculative
+           Mark the current condition as True so we enter the branch
+        """
+        # get the current condition
+        cond = state.inspect.exit_guard
+        
+        if cond is None:
+            return
+        
+        state.globals["guard"] = cond
+        state.globals["_pre_branch_count"] = len(state.solver.constraints)
+        state.inspect.exit_guard = claripy.BoolV(True)
+
+def on_branch(state):
+    """After the conditional branch remove the added constraint
+        Detect whether the condition was dependent on a secret
+    """
+    # get the branch condition and address for the current state
+    cond = state.globals["guard"]
+    addr = state.addr
+
+    # continue only if the state wasn't already speculated 
+    if cond is None or addr in speculated_branches:
+        return
+    speculated_branches.add(addr)
+
+    # remove the constraint that was added by the conditional branch
+    pre_count = state.globals.get("_pre_branch_count", 0)        
+    state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
+
+    # retrieve the variables dependent on secret
+    secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
+
+    # get the variables of the condition
+    cond_vars = {strip_suffix(var) for var in cond.variables}
+    
+    # mark the state that went into the branch as speculative
+    if state.solver.satisfiable(extra_constraints=[cond]):
+        state.globals["speculative"] = True
+
+    # mark the case as speculative
+    results[case_name]["speculative"] = True
+    results[case_name]["addrs"].add(state.addr)
+
+    # check whether the condition is dependent on a secret or secret-tainted value
+    if cond_vars & secret_symbols or cond_vars & secret_dependent_vars:
+        mark_as_leaky(state, addr)
+
+
+def mem_read(state):
+    """Before a memory read, check whether secret memory can be accessed
+        If secret memory was accessed mark the read expression as dependent on a secret
+        If secret dependent variables were used as an address, report leakage
+    """
+    # if we are not in a speculative state don't proceed
+    if not state.globals.get('speculative'):
+        return 
+    
+    # get the address from which memory will be read
+    addr = state.inspect.mem_read_address
+
+    # get the value being read
+    expr = state.inspect.mem_read_expr
+
+    if addr is None or expr is None:
+        return
+
+    # get the variables dependent on a secret
+    secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
+
+    # get the predicate for determining secret memory access
+    in_secret = state.globals["leak_pred"]
+
+    # check whether it is possible to access secret memory
+    if state.solver.satisfiable(extra_constraints=[in_secret]):
+        for var in expr.variables:
+            stripped = strip_suffix(var)
+            state.globals["taint_vars"].add(stripped)
+            state.globals["secret_dependent_vars"].add(stripped)
+
+    # if we have read a secret, mark all the variables of the read expression as tainted and secret_dependent
+    if any(strip_suffix(var) in secret_symbols for var in expr.variables):
+        for var in expr.variables:
+            stripped_var = strip_suffix(var)
+            state.globals["taint_vars"].add(stripped_var)
+            state.globals["secret_dependent_vars"].add(stripped_var)
+
+    # if a secret was used to determine the address of memory read, mark as leaky
+    if any(strip_suffix(var) in secret_symbols for var in addr.variables):
+        mark_as_leaky(state, addr)
+        return
+
+    # if a secret dependent variable was used to determine the address of memory read, mark as leaky
+    if any(strip_suffix(var) in secret_dependent_vars for var in addr.variables):
+        mark_as_leaky(state, addr)
+        return
+
+def on_reg_write(state):
+    """Taint register in case a tainted expression is being written"""
+    # if we are not in a speculative state don't proceed
+    if not state.globals.get('speculative'):
+        return 
+    
+    # retrieve the expression that is going to be written to a register
+    expr = state.inspect.reg_write_expr
+
+    # check whether the expression exists
+    if expr is None:
+        return
+
+    # retrieve the offset of the target register
+    reg_offset = state.inspect.reg_write_offset
+
+    # based on the register offset, get the register name
+    reg_name = state.arch.translate_register_name(reg_offset, size=8)
+
+    # get the tainted variables
+    taint_vars = state.globals.get("taint_vars", set())
+        
+    # proceed only if the expression includes a tainted value
+    if is_tainted(expr, taint_vars):
+
+        # taint the target register
+        state.globals["taint_vars"].add(reg_name)
+
+        # the expression is tainted, so taint every symbolic variable
+        for var in expr.variables:
+            stripped_var = strip_suffix(var)
+            state.globals["taint_vars"].add(stripped_var)
+
+def propagate_speculative_flag(state):
+    """Propagate speculative flag from parent states to the children"""
+    # set the parent state
+    if state.history.parent is None:
+        parent_state = None
+    else:
+        parent_state = state.history.parent.state
+
+    if parent_state:
+        # inherit speculative flag from parent state
+        if parent_state.globals.get('speculative', False):
+            state.globals['speculative'] = True
+
+        # inherit taint variables from parent state
+        state.globals["taint_vars"] = set(parent_state.globals.get("taint_vars", set()))
+    else:
+        # initialize taint variables from attacker input
+        state.globals["taint_vars"] = set(sym_input.variables)
+
+def count_speculative_instructions(state):
+    """Count the number of speculative instruction executed"""
+    if state.globals.get("speculative"):
+        speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+        block = proj.factory.block(state.addr)
+        speculative_instruction_count += len(block.capstone.insns)
+        state.globals["spec_instr_count"] = speculative_instruction_count
+
+# determine if the address is tainted
+def is_tainted(expr, taint_vars):
+    return any(var in taint_vars for var in expr.variables)
+    
+
+def mark_as_leaky(state, addr):
+    """Mark the state as leaky and determine the attacker input that lead to this leakage"""
+    leak_key = (state.addr, str(addr))
+
+    # we only have to determine if the function is leaky only once, if it's already leaky just skip
+    if leak_key not in results[case_name]["addrs"]:
+        results[case_name]["addrs"].add(leak_key)
+        results[case_name]["leakage"] = True
+        results[case_name]["speculative"] = state.globals.get("speculative", False)
+        state.globals['leakage'] = True
+        concrete_idx = state.solver.eval(idx)
+        results[case_name].setdefault("inputs", []).append(hex(concrete_idx))
+
+# keep only the first secret symbol description
+def strip_suffix(var):
+    return "_".join(var.split("_")[:2])
+
 # run the whole process for every case sequentially
 for case_name in case_names:
     func = cfg.kb.functions.function(name=case_name)
@@ -188,187 +369,6 @@ for case_name in case_names:
 
     # build the predicate for reading from secret memory
     build_sec_mem_predicate(state, idx)
-
-    def record_branch_count(state):
-        """Record the number of constraints before the conditional branch
-           Save the original exit guard that will then determine which state is speculative
-           Mark the current condition as True so we enter the branch
-        """
-        # get the current condition
-        cond = state.inspect.exit_guard
-        
-        if cond is None:
-            return
-        
-        state.globals["guard"] = cond
-        state.globals["_pre_branch_count"] = len(state.solver.constraints)
-        state.inspect.exit_guard = claripy.BoolV(True)
-
-    def on_branch(state):
-        """After the conditional branch remove the added constraint
-           Detect whether the condition was dependent on a secret
-        """
-        # get the branch condition and address for the current state
-        cond = state.globals["guard"]
-        addr = state.addr
-
-        # continue only if the state wasn't already speculated 
-        if cond is None or addr in speculated_branches:
-            return
-        speculated_branches.add(addr)
-
-        # remove the constraint that was added by the conditional branch
-        pre_count = state.globals.get("_pre_branch_count", 0)        
-        state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
-
-        # retrieve the variables dependent on secret
-        secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
-
-        # get the variables of the condition
-        cond_vars = {strip_suffix(var) for var in cond.variables}
-        
-        # mark the state that went into the branch as speculative
-        if state.solver.satisfiable(extra_constraints=[cond]):
-            state.globals["speculative"] = True
-
-        # mark the case as speculative
-        results[case_name]["speculative"] = True
-        results[case_name]["addrs"].add(state.addr)
-
-        # check whether the condition is dependent on a secret or secret-tainted value
-        if cond_vars & secret_symbols or cond_vars & secret_dependent_vars:
-            mark_as_leaky(state, addr)
-
-
-    def mem_read(state):
-        """Before a memory read, check whether secret memory can be accessed
-           If secret memory was accessed mark the read expression as dependent on a secret
-           If secret dependent variables were used as an address, report leakage
-        """
-        # if we are not in a speculative state don't proceed
-        if not state.globals.get('speculative'):
-            return 
-        
-        # get the address from which memory will be read
-        addr = state.inspect.mem_read_address
-
-        # get the value being read
-        expr = state.inspect.mem_read_expr
-
-        if addr is None or expr is None:
-            return
-
-        # get the variables dependent on a secret
-        secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
-
-        # get the predicate for determining secret memory access
-        in_secret = state.globals["leak_pred"]
-
-        # check whether it is possible to access secret memory
-        if state.solver.satisfiable(extra_constraints=[in_secret]):
-            for var in expr.variables:
-                stripped = strip_suffix(var)
-                state.globals["taint_vars"].add(stripped)
-                state.globals["secret_dependent_vars"].add(stripped)
-
-        # if we have read a secret, mark all the variables of the read expression as tainted and secret_dependent
-        if any(strip_suffix(var) in secret_symbols for var in expr.variables):
-            for var in expr.variables:
-                stripped_var = strip_suffix(var)
-                state.globals["taint_vars"].add(stripped_var)
-                state.globals["secret_dependent_vars"].add(stripped_var)
-
-        # if a secret was used to determine the address of memory read, mark as leaky
-        if any(strip_suffix(var) in secret_symbols for var in addr.variables):
-            mark_as_leaky(state, addr)
-            return
-
-        # if a secret dependent variable was used to determine the address of memory read, mark as leaky
-        if any(strip_suffix(var) in secret_dependent_vars for var in addr.variables):
-            mark_as_leaky(state, addr)
-            return
-    
-    def on_reg_write(state):
-        """Taint register in case a tainted expression is being written"""
-        # if we are not in a speculative state don't proceed
-        if not state.globals.get('speculative'):
-            return 
-        
-        # retrieve the expression that is going to be written to a register
-        expr = state.inspect.reg_write_expr
-
-        # check whether the expression exists
-        if expr is None:
-            return
-
-        # retrieve the offset of the target register
-        reg_offset = state.inspect.reg_write_offset
-
-        # based on the register offset, get the register name
-        reg_name = state.arch.translate_register_name(reg_offset, size=8)
-
-        # get the tainted variables
-        taint_vars = state.globals.get("taint_vars", set())
-            
-        # proceed only if the expression includes a tainted value
-        if is_tainted(expr, taint_vars):
-
-            # taint the target register
-            state.globals["taint_vars"].add(reg_name)
-
-            # the expression is tainted, so taint every symbolic variable
-            for var in expr.variables:
-                stripped_var = strip_suffix(var)
-                state.globals["taint_vars"].add(stripped_var)
-
-    def propagate_speculative_flag(state):
-        """Propagate speculative flag from parent states to the children"""
-        # set the parent state
-        if state.history.parent is None:
-            parent_state = None
-        else:
-            parent_state = state.history.parent.state
-
-        if parent_state:
-            # inherit speculative flag from parent state
-            if parent_state.globals.get('speculative', False):
-                state.globals['speculative'] = True
-
-            # inherit taint variables from parent state
-            state.globals["taint_vars"] = set(parent_state.globals.get("taint_vars", set()))
-        else:
-            # initialize taint variables from attacker input
-            state.globals["taint_vars"] = set(sym_input.variables)
-
-    def count_speculative_instructions(state):
-        """Count the number of speculative instruction executed"""
-        if state.globals.get("speculative"):
-            speculative_instruction_count = state.globals.get("spec_instr_count", 0)
-            block = proj.factory.block(state.addr)
-            speculative_instruction_count += len(block.capstone.insns)
-            state.globals["spec_instr_count"] = speculative_instruction_count
-
-    # determine if the address is tainted
-    def is_tainted(expr, taint_vars):
-        return any(var in taint_vars for var in expr.variables)
-        
-    
-    def mark_as_leaky(state, addr):
-        """Mark the state as leaky and determine the attacker input that lead to this leakage"""
-        leak_key = (state.addr, str(addr))
-
-        # we only have to determine if the function is leaky only once, if it's already leaky just skip
-        if leak_key not in results[case_name]["addrs"]:
-            results[case_name]["addrs"].add(leak_key)
-            results[case_name]["leakage"] = True
-            results[case_name]["speculative"] = state.globals.get("speculative", False)
-            state.globals['leakage'] = True
-            concrete_idx = state.solver.eval(idx)
-            results[case_name].setdefault("inputs", []).append(hex(concrete_idx))
-
-    # keep only the first secret symbol description
-    def strip_suffix(var):
-        return "_".join(var.split("_")[:2])
     
     # Hooks
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
