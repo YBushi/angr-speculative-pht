@@ -1,3 +1,12 @@
 Binary,I,Iunr,Time,Result
-case_6,13,13,1.73,Insecure
-spectre_test1,13,13,1.73,Insecure
+case_0,,,1.37,Insecure
+case_1,,,3.0,Insecure
+case_2,,,2.11,Insecure
+case_3,,,0.58,Insecure
+case_4,,,1.32,Insecure
+case_5,0,0,0.0,Secure
+case_6,13,13,2840.82,Insecure
+case_7,12,12,0.04,Insecure
+case_8,12,12,0.04,Insecure
+case_9,0,0,0.0,Secure
+spectre_test1,37,37,2849.28,Insecure

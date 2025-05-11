@@ -22,8 +22,10 @@ void case_0(uint64_t idx) {
 
 // ✅ safe — uses masking to avoid OOB access
 void case_1(uint64_t idx) {
-    uint64_t safe_idx = idx & publicarray_mask;
-    temp &= publicarray2[publicarray[safe_idx] * 512];
+    if (idx < publicarray_size) {
+        uint64_t safe_idx = idx & publicarray_mask;
+        temp &= publicarray2[publicarray[safe_idx] * 512];
+    }
 }
 
 // 🔥 leaky — double indexing via secret
@@ -73,7 +75,7 @@ void case_7(uint64_t idx) {
     }
 }
 
-// ✅ safe — inner loop unrolled but no secret usage
+// 🔥 leaky — loop variant
 void case_8(uint64_t idx) {
     for (uint64_t i = 0; i <= idx && i < publicarray_size; ++i) {
         temp &= publicarray2[publicarray[i] * 512];
