@@ -169,6 +169,7 @@ def mem_read(state):
 
     # check whether it is possible to access secret memory
     if state.solver.satisfiable(extra_constraints=[in_secret]):
+        # print(f"IDX CAN STILL HIT SECRET MEMORY WITH CONTRAINTS: {state.solver.constraints}")
         for var in expr.variables:
             stripped = strip_suffix(var)
             state.globals["taint_vars"].add(stripped)
@@ -224,6 +225,28 @@ def on_reg_write(state):
             stripped_var = strip_suffix(var)
             state.globals["taint_vars"].add(stripped_var)
 
+def on_irsb(state):
+    # TODO for now this is also kind of primitive, should make it more robust
+    """Retrieve the publicarray mask and if this state is masking the index add is as a constraint"""
+    addr = state.addr
+    irsb = proj.factory.block(addr).vex
+    mask = state.globals.get('publicarray_mask')
+    
+    # if there is no musk declared in the file don't add any constraints
+    if mask is None:
+        return 
+    
+    for stmt in irsb.statements:
+        # check if there is a binary operation
+        if stmt.tag == 'Ist_WrTmp' and stmt.data.tag == 'Iex_Binop':
+            operator = stmt.data
+
+            # if there is a bitwiseAnd operation, add the constraint
+            if operator.op in ('Iop_And32', 'Iop_And64'):
+                mask_bvv = claripy.BVV(mask, idx.size())
+                constraint = (idx & ~mask_bvv) == 0
+                state.add_constraints(constraint)
+
 def propagate_speculative_flag(state):
     """Propagate speculative flag from parent states to the children"""
     # set the parent state
@@ -255,7 +278,6 @@ def count_speculative_instructions(state):
 def is_tainted(expr, taint_vars):
     return any(var in taint_vars for var in expr.variables)
     
-
 def mark_as_leaky(state, addr):
     """Mark the state as leaky and determine the attacker input that lead to this leakage"""
     leak_key = (state.addr, str(addr))
@@ -344,13 +366,18 @@ for case_name in case_names:
     state.globals["secretarray_base"] = secret_addr
     state.globals["secretarray_size"] = secret_size
 
-   # get the address of the publicarray and determine its size
+   # get the address of the publicarray and determine its size, retrieve publicarray mask
     public_sym = proj.loader.main_object.get_symbol("publicarray")
+    mask_sym = proj.loader.main_object.get_symbol("publicarray_mask")
     public_addr = public_sym.rebased_addr
     public_size = public_sym.size
     state.globals["publicarray_base"] = public_addr
     state.globals["publicarray_size"] = public_size
 
+    # TODO for now this is a primitive solution, should make it more robust
+    if mask_sym is not None:
+        state.globals["publicarray_mask"] = public_size-1
+    
     # put symbolic secret values in secretarray
     for i in range(secret_size):
         symb = claripy.BVS(f"secret_{i}", 8)
@@ -369,7 +396,7 @@ for case_name in case_names:
 
     # build the predicate for reading from secret memory
     build_sec_mem_predicate(state, idx)
-    
+
     # Hooks
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
     state.inspect.b('exit', when=angr.BP_BEFORE, action=record_branch_count) # triggers after branch is resolved
@@ -377,11 +404,11 @@ for case_name in case_names:
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
     state.inspect.b('reg_write', when=angr.BP_AFTER, action=on_reg_write) # triggers after writing to a register
+    state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before an instruction block is executed
 
     start_time = time.time()
     speculative_instruction_count = 0
     simgr.stashes.setdefault('committed', [])
-
 
     # execute while there are active states
     while simgr.active:
