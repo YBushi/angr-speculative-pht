@@ -109,8 +109,8 @@ def has_branching(func):
 
 def record_branch_count(state):
     """Record the number of constraints before the conditional branch
-        Save the original exit guard that will then determine which state is speculative
-        Mark the current condition as True so we enter the branch
+       Save the original exit guard that will then determine which state is speculative
+       Mark the current condition as True so we enter the branch
     """
     # get the current condition
     cond = state.inspect.exit_guard
@@ -124,7 +124,7 @@ def record_branch_count(state):
 
 def on_branch(state):
     """After the conditional branch remove the added constraint
-        Detect whether the condition was dependent on a secret
+       Detect whether the condition was dependent on a secret
     """
     # get the branch condition and address for the current state
     cond = state.globals["guard"]
@@ -173,8 +173,8 @@ def on_branch(state):
 
 def mem_read(state):
     """Before a memory read, check whether secret memory can be accessed
-        If secret memory was accessed mark the read expression as dependent on a secret
-        If secret dependent variables were used as an address, report leakage
+       If secret memory was accessed mark the read expression as dependent on a secret
+       If secret dependent variables were used as an address, report leakage
     """
     # get the address from which memory will be read
     addr = state.inspect.mem_read_address
@@ -241,7 +241,9 @@ def count_speculative_instructions(state):
     state.globals["spec_instr_count"] = speculative_instruction_count
     
 def mark_as_leaky(state, addr):
-    """Mark the state as leaky and determine the attacker input that lead to this leakage"""
+    """Mark the state as leaky and determine the attacker input that lead to this leakage
+       Afterwards, halt the execution of this state by moving it to deadended
+    """
     leak_key = (state.addr, str(addr))
 
     # we only have to determine if the function is leaky only once, if it's already leaky just skip
@@ -252,6 +254,7 @@ def mark_as_leaky(state, addr):
         concrete_idx = state.solver.eval(idx)
         results[case_name].setdefault("inputs", []).append(hex(concrete_idx))
         simgr.move('active', 'deadended', lambda s: True)
+
 
 def taint(state, expr):
     """Add symbolic variables to the secret symbols"""
@@ -409,14 +412,11 @@ for case_name in case_names:
         # advance states
         simgr.step()
 
-        # move the unsat states to deadended so I can check them manually
-        simgr.move('unsat', 'deadended', lambda s: True)
-
-        # for every active speculative state check whether it hasn't exceed the speculative window
         for state in simgr.active:
+            
             # if the state has exceeded the speculative window move it to deadened
             spec_inst_count = state.globals.get("spec_instr_count", 0)
-            if state.globals.get("spec_instr_count", 0) >= SPECULATIVE_WINDOW:
+            if state.globals.get("spec_instr_count", 0) > SPECULATIVE_WINDOW:
                 preds = state.globals.get("path_predicates", [])
 
                 # build conjunction (or “true” if empty)
@@ -427,7 +427,9 @@ for case_name in case_names:
                 else:
                     path_cond = state.solver.true
 
-                # if the state predicate is not satisfiable, we are in a speculative state
+                """If the path predicate is unsatisfiable, we are in a speculative state
+                   This state has passed it's speculative window and has been rolled back
+                """
                 if not state.solver.satisfiable(extra_constraints=[path_cond]):                    
                     # move the state to deadended
                     simgr.move(from_stash='active', to_stash='deadended',
@@ -436,24 +438,6 @@ for case_name in case_names:
                     # this is the path taken by normal execution, reset the speculative window
                     state.globals["path_predicates"] = []
                     state.globals["spec_instr_count"] = 0
-            
-            # go through deadended states, and check whether a leakage was reported
-            for state in simgr.deadended:
-                preds = state.globals.get("path_predicates", [])
-                if preds:
-                    path_cond = preds[0]
-                    for p in preds[1:]:
-                        path_cond = state.solver.And(path_cond, p)
-                else:
-                    path_cond = state.solver.true
-
-                if not state.solver.satisfiable(extra_constraints=[path_cond]):
-                    # check if we have found a leakage in this state
-                    if state.globals.get("leakage", False):
-                        results[case_name]["leakage"] = True
-                        for inp in state.globals.get("leak_inputs", []):
-                            results[case_name]("inputs", []).append(inp)
-                        break
 
             # if we have already detected a leakage, halt the execution
             if results[case_name]["leakage"]:

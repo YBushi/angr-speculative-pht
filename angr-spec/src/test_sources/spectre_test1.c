@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-uint8_t publicarray[16] = {0};
+uint8_t publicarray[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
 uint8_t publicarray2[256 * 512];
 uint8_t secretarray[16] = {
     42, 43, 44, 45, 46, 47, 48, 49,
@@ -98,6 +98,16 @@ int case_10(uint64_t idx) {
     return 2;
 }
 
+// This case is not leaky, because the speculative window expires before the mem_read is reached
+void case_11(uint64_t idx) {
+    if (idx < publicarray_size) {
+        temp &= secretarray[0];
+        if (temp){
+            temp = 1;
+        }
+    }
+}
+
 
 int main() {
     case_0(2);   // 🔥
@@ -111,5 +121,6 @@ int main() {
     case_8(2);   // ✅
     case_9(2);   // 🚫
     case_10(2);
+    case_11(2);
     return 0;
 }
