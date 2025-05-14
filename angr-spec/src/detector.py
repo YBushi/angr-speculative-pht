@@ -5,6 +5,7 @@ import csv
 import sys
 import re
 import capstone
+import copy
 from collections import defaultdict
 from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
 import logging
@@ -38,7 +39,7 @@ specific_case = sys.argv[2] if len(sys.argv) >= 3 else None
 SPECULATIVE_WINDOW = 200
 
 # create an angr project from the binary
-proj = angr.Project(binary_path, auto_load_libs=False)
+proj = angr.Project(binary_path, auto_load_libs=False, default_analysis_mode='symbolic', use_sim_procedures=False)
 
 # create a symbolic memory from memsightpp
 CTMemory._set_memsight_ranges(proj)
@@ -64,22 +65,36 @@ results = defaultdict(lambda: {
     "Time": None
 })
 
+# initialize public memory data
+public_sym = proj.loader.main_object.get_symbol("publicarray")
+public_array_sym = proj.loader.main_object.get_symbol("publicarray_size")
+mask_sym = proj.loader.main_object.get_symbol("publicarray_mask")
+public_addr = public_sym.rebased_addr
+public_size = public_sym.size
+public_size_addr = public_array_sym.rebased_addr
+
+# initialize secret memory data
+secret_sym = proj.loader.main_object.get_symbol("secretarray")
+secret_array_sym = proj.loader.main_object.get_symbol("publicarray_size")
+secret_addr = secret_sym.rebased_addr
+secret_size = secret_sym.size
+secret_size_addr = secret_array_sym.rebased_addr
 
 def build_sec_mem_predicate(state, idx):
-        """Build the predicate that needs to be satisfied for idx to reach secret memory"""
-        secret_addr = state.globals["secretarray_base"]
-        secret_size = state.globals["secretarray_size"]
-        public_addr = state.globals["publicarray_base"]
+    """Build the predicate that needs to be satisfied for idx to reach secret memory"""
+    secret_addr = state.globals["secretarray_addr"]
+    secret_size = state.globals["secretarray_size"]
+    public_addr = state.globals["publicarray_addr"]
 
-        offset = secret_addr - public_addr
-        idx_width = idx.size()
-        delta = claripy.BVV(offset, idx_width)
-        delta_end = claripy.BVV(offset + secret_size, idx_width)
-        in_secret = claripy.And(
-            claripy.UGE(idx,      delta), 
-            claripy.ULT(idx,      delta_end),
-            )
-        state.globals["leak_pred"] = in_secret
+    offset = secret_addr - public_addr
+    idx_width = idx.size()
+    delta = claripy.BVV(offset, idx_width)
+    delta_end = claripy.BVV(offset + secret_size, idx_width)
+    in_secret = claripy.And(
+        claripy.UGE(idx,      delta), 
+        claripy.ULT(idx,      delta_end),
+        )
+    state.globals["leak_pred"] = in_secret
 
 def has_branching(func):
     """Check whether the test case has a conditional jump, which can be mis-predicted
@@ -93,19 +108,19 @@ def has_branching(func):
     return False
 
 def record_branch_count(state):
-        """Record the number of constraints before the conditional branch
-           Save the original exit guard that will then determine which state is speculative
-           Mark the current condition as True so we enter the branch
-        """
-        # get the current condition
-        cond = state.inspect.exit_guard
-        
-        if cond is None:
-            return
-        
-        state.globals["guard"] = cond
-        state.globals["_pre_branch_count"] = len(state.solver.constraints)
-        state.inspect.exit_guard = claripy.BoolV(True)
+    """Record the number of constraints before the conditional branch
+        Save the original exit guard that will then determine which state is speculative
+        Mark the current condition as True so we enter the branch
+    """
+    # get the current condition
+    cond = state.inspect.exit_guard
+    
+    if cond is None:
+        return
+    
+    state.globals["guard"] = cond
+    state.globals["_pre_branch_count"] = len(state.solver.constraints)
+    state.inspect.exit_guard = claripy.BoolV(True)
 
 def on_branch(state):
     """After the conditional branch remove the added constraint
@@ -115,43 +130,52 @@ def on_branch(state):
     cond = state.globals["guard"]
     addr = state.addr
 
-    # continue only if the state wasn't already speculated 
+    # continue only if the branch wasn't already speculated on
     if cond is None or addr in speculated_branches:
         return
     speculated_branches.add(addr)
+
+    # the actual target addr that this state has jumped to
+    target = state.solver.eval(state.history.jump_target) 
+
+    # the addr of the successor the branch should have taken
+    true_target = state.solver.eval(state.inspect.exit_target)
+
+    # retrieve the path predicates and create a new reference
+    old_path_predicates = state.globals.get("path_predicates", [])
+    new_path_pred = list(old_path_predicates)
+    # print("Path predicates before adding:")
+    # print_path_pred(old_path_predicates)
+
+    # if this state represents true branch
+    if target == true_target:
+        pred = cond
+    
+    # if this state represent the false branch
+    else:
+        pred = claripy.Not(cond)
+    
+    # append the new predicate and save it to globals
+    new_path_pred.append(pred)
+    # print("Path predicates after adding")
+    # print_path_pred(new_path_pred)
+    # print("END OF PREDICATES\n\n")
+    state.globals["path_predicates"] = new_path_pred
 
     # remove the constraint that was added by the conditional branch
     pre_count = state.globals.get("_pre_branch_count", 0)        
     state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
 
-    # retrieve the variables dependent on secret
-    secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
-
-    # get the variables of the condition
-    cond_vars = {strip_suffix(var) for var in cond.variables}
-    
-    # mark the state that went into the branch as speculative
-    if state.solver.satisfiable(extra_constraints=[cond]):
-        state.globals["speculative"] = True
-
-    # mark the case as speculative
-    results[case_name]["speculative"] = True
-    results[case_name]["addrs"].add(state.addr)
-
-    # check whether the condition is dependent on a secret or secret-tainted value
-    if cond_vars & secret_symbols or cond_vars & secret_dependent_vars:
+    # if the condition is not dependent on a secret, we can return
+    if check_secret_dependency(state, cond):
         mark_as_leaky(state, addr)
-
+        return
 
 def mem_read(state):
     """Before a memory read, check whether secret memory can be accessed
         If secret memory was accessed mark the read expression as dependent on a secret
         If secret dependent variables were used as an address, report leakage
     """
-    # if we are not in a speculative state don't proceed
-    if not state.globals.get('speculative'):
-        return 
-    
     # get the address from which memory will be read
     addr = state.inspect.mem_read_address
 
@@ -160,73 +184,26 @@ def mem_read(state):
 
     if addr is None or expr is None:
         return
-
-    # get the variables dependent on a secret
-    secret_dependent_vars = state.globals.get("secret_dependent_vars", set())
-
-    # get the predicate for determining secret memory access
-    in_secret = state.globals["leak_pred"]
-
-    # check whether it is possible to access secret memory
-    if state.solver.satisfiable(extra_constraints=[in_secret]):
-        # print(f"IDX CAN STILL HIT SECRET MEMORY WITH CONTRAINTS: {state.solver.constraints}")
-        for var in expr.variables:
-            stripped = strip_suffix(var)
-            state.globals["taint_vars"].add(stripped)
-            state.globals["secret_dependent_vars"].add(stripped)
-
-    # if we have read a secret, mark all the variables of the read expression as tainted and secret_dependent
-    if any(strip_suffix(var) in secret_symbols for var in expr.variables):
-        for var in expr.variables:
-            stripped_var = strip_suffix(var)
-            state.globals["taint_vars"].add(stripped_var)
-            state.globals["secret_dependent_vars"].add(stripped_var)
-
-    # if a secret was used to determine the address of memory read, mark as leaky
-    if any(strip_suffix(var) in secret_symbols for var in addr.variables):
-        mark_as_leaky(state, addr)
-        return
-
-    # if a secret dependent variable was used to determine the address of memory read, mark as leaky
-    if any(strip_suffix(var) in secret_dependent_vars for var in addr.variables):
-        mark_as_leaky(state, addr)
-        return
-
-def on_reg_write(state):
-    """Taint register in case a tainted expression is being written"""
-    # if we are not in a speculative state don't proceed
-    if not state.globals.get('speculative'):
-        return 
     
-    # retrieve the expression that is going to be written to a register
-    expr = state.inspect.reg_write_expr
+    # if we can access secret memory, taint the expression being read
+    in_secret = state.globals["leak_pred"]
+    if state.solver.satisfiable(extra_constraints=[in_secret]):
+        taint(state, expr)
 
-    # check whether the expression exists
-    if expr is None:
+    # if we have an expression dependent on secret, taint the expression
+    if check_secret_dependency(state, expr):
+        taint(state, expr)
+    
+    # if the address isn't secret dependent we can return
+    if not check_secret_dependency(state, addr):
         return
 
-    # retrieve the offset of the target register
-    reg_offset = state.inspect.reg_write_offset
-
-    # based on the register offset, get the register name
-    reg_name = state.arch.translate_register_name(reg_offset, size=8)
-
-    # get the tainted variables
-    taint_vars = state.globals.get("taint_vars", set())
-        
-    # proceed only if the expression includes a tainted value
-    if is_tainted(expr, taint_vars):
-
-        # taint the target register
-        state.globals["taint_vars"].add(reg_name)
-
-        # the expression is tainted, so taint every symbolic variable
-        for var in expr.variables:
-            stripped_var = strip_suffix(var)
-            state.globals["taint_vars"].add(stripped_var)
-
+    # if the leak has occurred in a speculative state, mark as leaky and halt the execution
+    if is_speculative_leak(state):
+        mark_as_leaky(state, addr)
+        return
+    
 def on_irsb(state):
-    # TODO for now this is also kind of primitive, should make it more robust
     """Retrieve the publicarray mask and if this state is masking the index add is as a constraint"""
     addr = state.addr
     irsb = proj.factory.block(addr).vex
@@ -247,36 +224,21 @@ def on_irsb(state):
                 constraint = (idx & ~mask_bvv) == 0
                 state.add_constraints(constraint)
 
-def propagate_speculative_flag(state):
-    """Propagate speculative flag from parent states to the children"""
-    # set the parent state
-    if state.history.parent is None:
-        parent_state = None
-    else:
-        parent_state = state.history.parent.state
+def check_secret_dependency(state, expr):
+    """Check whether an expression is dependent on a secret"""
+    if len(secret_symbols) > 0:
+        renamed_secrets = {secret.cache_key:
+                           state.solver.BVV(0, secret.size()) for secret in secret_symbols}
 
-    if parent_state:
-        # inherit speculative flag from parent state
-        if parent_state.globals.get('speculative', False):
-            state.globals['speculative'] = True
-
-        # inherit taint variables from parent state
-        state.globals["taint_vars"] = set(parent_state.globals.get("taint_vars", set()))
-    else:
-        # initialize taint variables from attacker input
-        state.globals["taint_vars"] = set(sym_input.variables)
+        expr_renamed = expr.replace_dict(renamed_secrets)
+        return state.solver.satisfiable(extra_constraints=[expr != expr_renamed], exact=True)
 
 def count_speculative_instructions(state):
     """Count the number of speculative instruction executed"""
-    if state.globals.get("speculative"):
-        speculative_instruction_count = state.globals.get("spec_instr_count", 0)
-        block = proj.factory.block(state.addr)
-        speculative_instruction_count += len(block.capstone.insns)
-        state.globals["spec_instr_count"] = speculative_instruction_count
-
-# determine if the address is tainted
-def is_tainted(expr, taint_vars):
-    return any(var in taint_vars for var in expr.variables)
+    speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+    block = proj.factory.block(state.addr)
+    speculative_instruction_count += len(block.capstone.insns)
+    state.globals["spec_instr_count"] = speculative_instruction_count
     
 def mark_as_leaky(state, addr):
     """Mark the state as leaky and determine the attacker input that lead to this leakage"""
@@ -284,16 +246,54 @@ def mark_as_leaky(state, addr):
 
     # we only have to determine if the function is leaky only once, if it's already leaky just skip
     if leak_key not in results[case_name]["addrs"]:
-        results[case_name]["addrs"].add(leak_key)
         results[case_name]["leakage"] = True
-        results[case_name]["speculative"] = state.globals.get("speculative", False)
-        state.globals['leakage'] = True
+        results[case_name]["speculative"] = True
+        results[case_name]["addrs"].add(state.addr)
         concrete_idx = state.solver.eval(idx)
         results[case_name].setdefault("inputs", []).append(hex(concrete_idx))
+        simgr.move('active', 'deadended', lambda s: True)
+
+def taint(state, expr):
+    """Add symbolic variables to the secret symbols"""
+    # get the secret symbols
+    secret_symbols = state.globals.get("secret_symbols", set())
+
+    # add symbolic variables that were tainted into the secret_symbols
+    for var in expr.variables:
+        stripped = strip_suffix(var)
+        sym = claripy.BVS(stripped, 8)
+        if sym is not None and sym not in secret_symbols:
+            secret_symbols.add(sym)
+
+def is_speculative_leak(state):
+    """Determine whether we are in a speculative state"""
+    predicates = state.globals.get("path_predicates", [])
+    in_secret = state.globals["leak_pred"]
+    # build conjunction of predicates
+    if predicates:
+        path_cond = predicates[0]
+        for predicate in predicates[1:]:
+            path_cond = state.solver.And(path_cond, predicate)
+    else:
+        path_cond = state.solver.true
+
+    # if the constraints are not satisfiable, we are in a speculative state
+    return not state.solver.satisfiable(extra_constraints=[path_cond, in_secret])
 
 # keep only the first secret symbol description
 def strip_suffix(var):
     return "_".join(var.split("_")[:2])
+
+# FOR DEBUG!
+def print_path_pred(pred_list):
+    if len(pred_list) == 0:
+        print("[]")
+        print("-------------------------------------------------------------")
+    counter = 0
+    for pred in pred_list:
+        print(f"Predicate [{counter}: {pred}]")
+        print("-------------------------------------------------------------")
+        counter+=1
 
 # run the whole process for every case sequentially
 for case_name in case_names:
@@ -320,7 +320,6 @@ for case_name in case_names:
 
     SimState.register_default('memory', CTMemory)
 
-    # initialize call (entry) state
     state = state = proj.factory.call_state(func.addr, idx)
     block = proj.factory.block(state.addr)
 
@@ -353,43 +352,41 @@ for case_name in case_names:
     state.options.discard(angr.options.SIMPLIFY_EXPRS)
     state.options.discard(angr.options.SIMPLIFY_CONSTRAINTS)
 
-    # create a metadata which tracks tainted variables
-    state.globals["taint_vars"] = set(taint_sources)
-
     # create a set for variables that are secret dependent
     state.globals["secret_dependent_vars"] = set()
 
     # get the address of the secretarray and determine its size
-    secret_sym = proj.loader.main_object.get_symbol("secretarray")
-    secret_addr = secret_sym.rebased_addr
-    secret_size = secret_sym.size
-    state.globals["secretarray_base"] = secret_addr
+    state.globals["secretarray_addr"] = secret_addr
     state.globals["secretarray_size"] = secret_size
 
-   # get the address of the publicarray and determine its size, retrieve publicarray mask
-    public_sym = proj.loader.main_object.get_symbol("publicarray")
-    mask_sym = proj.loader.main_object.get_symbol("publicarray_mask")
-    public_addr = public_sym.rebased_addr
-    public_size = public_sym.size
-    state.globals["publicarray_base"] = public_addr
+    # get the address of the publicarray and determine its size, retrieve publicarray mask
+    state.globals["publicarray_addr"] = public_addr
     state.globals["publicarray_size"] = public_size
 
     # TODO for now this is a primitive solution, should make it more robust
     if mask_sym is not None:
         state.globals["publicarray_mask"] = public_size-1
     
-    # put symbolic secret values in secretarray
+    state.memory.store(public_size_addr,
+                   claripy.BVV(public_size, 64), endness=proj.arch.memory_endness)
+    state.memory.store(secret_size_addr,
+                    claripy.BVV(secret_size, 64), endness=proj.arch.memory_endness)
+
+    # initialize the path predicate
+    state.globals["path_predicates"] = []
+    
+    # initialize the secret_symbols set and populate it
+    state.globals["secret_symbols"] = set()
+    secret_symbols = state.globals["secret_symbols"]
     for i in range(secret_size):
         symb = claripy.BVS(f"secret_{i}", 8)
+        secret_symbols.add(symb)
         state.memory.store(secret_addr + i, symb)
     
     # put symbolic values in publicarray
     for i in range(public_size):
         public_byte = claripy.BVS(f"public_{i}", 8)
         state.memory.store(public_addr + i, public_byte)
-
-    # create a set of secret symbols that we have to check for
-    secret_symbols = {f"secret_{i}" for i in range (secret_size)}
 
     # set a time limit for solving constraints
     state.solver.timeout = 1000
@@ -398,31 +395,65 @@ for case_name in case_names:
     build_sec_mem_predicate(state, idx)
 
     # Hooks
-    state.inspect.b('irsb', when=angr.BP_BEFORE, action=propagate_speculative_flag) # triggers before basic block execution
     state.inspect.b('exit', when=angr.BP_BEFORE, action=record_branch_count) # triggers after branch is resolved
     state.inspect.b('exit', when=angr.BP_AFTER, action=on_branch) # triggers after branch is resolved
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
-    state.inspect.b('reg_write', when=angr.BP_AFTER, action=on_reg_write) # triggers after writing to a register
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before an instruction block is executed
 
     start_time = time.time()
     speculative_instruction_count = 0
-    simgr.stashes.setdefault('committed', [])
 
     # execute while there are active states
     while simgr.active:
         # advance states
         simgr.step()
 
+        # move the unsat states to deadended so I can check them manually
+        simgr.move('unsat', 'deadended', lambda s: True)
+
         # for every active speculative state check whether it hasn't exceed the speculative window
         for state in simgr.active:
             # if the state has exceeded the speculative window move it to deadened
-            simgr.move(
-                from_stash='active',
-                to_stash='deadended',
-                filter_func=lambda s: s.globals.get("spec_instr_count", 0) >= SPECULATIVE_WINDOW
-            )
+            spec_inst_count = state.globals.get("spec_instr_count", 0)
+            if state.globals.get("spec_instr_count", 0) >= SPECULATIVE_WINDOW:
+                preds = state.globals.get("path_predicates", [])
+
+                # build conjunction (or “true” if empty)
+                if preds:
+                    path_cond = preds[0]
+                    for p in preds[1:]:
+                        path_cond = state.solver.And(path_cond, p)
+                else:
+                    path_cond = state.solver.true
+
+                # if the state predicate is not satisfiable, we are in a speculative state
+                if not state.solver.satisfiable(extra_constraints=[path_cond]):                    
+                    # move the state to deadended
+                    simgr.move(from_stash='active', to_stash='deadended',
+                            filter_func=lambda s: s is state)
+                else:
+                    # this is the path taken by normal execution, reset the speculative window
+                    state.globals["path_predicates"] = []
+                    state.globals["spec_instr_count"] = 0
+            
+            # go through deadended states, and check whether a leakage was reported
+            for state in simgr.deadended:
+                preds = state.globals.get("path_predicates", [])
+                if preds:
+                    path_cond = preds[0]
+                    for p in preds[1:]:
+                        path_cond = state.solver.And(path_cond, p)
+                else:
+                    path_cond = state.solver.true
+
+                if not state.solver.satisfiable(extra_constraints=[path_cond]):
+                    # check if we have found a leakage in this state
+                    if state.globals.get("leakage", False):
+                        results[case_name]["leakage"] = True
+                        for inp in state.globals.get("leak_inputs", []):
+                            results[case_name]("inputs", []).append(inp)
+                        break
 
             # if we have already detected a leakage, halt the execution
             if results[case_name]["leakage"]:
@@ -435,6 +466,10 @@ for case_name in case_names:
 
     end_time = time.time()
     results[case_name]["Time"] = end_time - start_time
+
+    # print("=== stash summary ===")
+    # for stash_name, stash_list in simgr.stashes.items():
+    #     print(f"  {stash_name:10s}: {len(stash_list)} state(s)")
 
     # loop for every terminal state
     for state in simgr.deadended:

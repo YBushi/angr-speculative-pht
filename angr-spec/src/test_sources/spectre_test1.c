@@ -17,6 +17,7 @@ uint64_t publicarray_mask = 15;
 void case_0(uint64_t idx) {
     if (idx < publicarray_size) {
         temp &= publicarray2[secretarray[idx] * 512];
+        return;
     }
 }
 
@@ -86,6 +87,17 @@ void case_8(uint64_t idx) {
 void case_9(uint64_t idx) {
     temp &= 0xFF;
 }
+int case_10(uint64_t idx) {
+    int a = secretarray[0];
+    int b = a ^ 1;
+    int c = a ^ 2;
+    int d = b ^ c ^ 3;
+    if(d) {
+        return idx;
+    }
+    return 2;
+}
+
 
 int main() {
     case_0(2);   // 🔥
@@ -98,5 +110,6 @@ int main() {
     case_7(2);   // 🔥
     case_8(2);   // ✅
     case_9(2);   // 🚫
+    case_10(2);
     return 0;
 }
