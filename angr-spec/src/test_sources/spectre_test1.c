@@ -1,17 +1,22 @@
 #include <stdint.h>
 #include <stddef.h>
+#ifdef __MSVC__
+#define FORCEDINLINE __forceinline
+#define NOINLINE __declspec(noinline)
+#else
+#define FORCEDINLINE __attribute__((always_inline)) inline
+#define NOINLINE __attribute__((noinline))
+#endif
 
-uint8_t publicarray[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
-uint8_t publicarray2[256 * 512];
-uint8_t secretarray[16] = {
-    42, 43, 44, 45, 46, 47, 48, 49,
-    50, 51, 52, 53, 54, 55, 56, 57
-};
-volatile uint8_t temp = 0;
-
-uint64_t publicarray_size = 16;
-uint64_t secretarray_size = 16;
 uint64_t publicarray_mask = 15;
+uint64_t publicarray_size = 16;
+uint8_t publicarray[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+uint8_t publicarray2[512 * 256] = { 20 };
+
+// The attacker's goal in all of these examples is to learn any of the secret data in secretarray
+uint64_t secretarray_size = 16;
+uint8_t secretarray[16] = { 10,21,32,43,54,65,76,87,98,109,110,121,132,143,154,165 };
+volatile uint8_t temp = 0;
 
 // 🔥 classic leaky Spectre v1
 void case_0(uint64_t idx) {
@@ -24,8 +29,7 @@ void case_0(uint64_t idx) {
 // ✅ safe — uses masking to avoid OOB access
 void case_1(uint64_t idx) {
     if (idx < publicarray_size) {
-        uint64_t safe_idx = idx & publicarray_mask;
-        temp &= publicarray2[publicarray[safe_idx] * 512];
+        temp &= publicarray2[publicarray[idx] * 512];
     }
 }
 
@@ -101,10 +105,7 @@ int case_10(uint64_t idx) {
 // This case is not leaky, because the speculative window expires before the mem_read is reached
 void case_11(uint64_t idx) {
     if (idx < publicarray_size) {
-        temp &= secretarray[0];
-        if (temp){
-            temp = 1;
-        }
+        temp &= publicarray2[publicarray[idx] * 512];
     }
 }
 
@@ -121,6 +122,6 @@ int main() {
     case_8(2);   // ✅
     case_9(2);   // 🚫
     case_10(2);
-    case_11(2);
+    case_11(0);
     return 0;
 }

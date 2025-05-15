@@ -6,6 +6,7 @@ import sys
 import re
 import capstone
 import copy
+import json
 from collections import defaultdict
 from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
 import logging
@@ -14,71 +15,64 @@ from angr.sim_state import SimState
 from ct_memory import CTMemory
 from claripy import UGE, ULT
 
-# uncomment only for presenting results!!!
-warnings.filterwarnings("ignore")
-logging.getLogger("angr.state_plugins.symbolic_memory").setLevel(logging.ERROR)
-logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.ERROR)
-
-# suppress warnings from memsight
-logging.getLogger("memsight").setLevel(logging.ERROR)
-
-# suppress angr's unconstrained successor warnings
-logging.getLogger("angr.engines.successors").setLevel(logging.ERROR)
-
-# load the binary and optionally a specific case name
-# if a specific case is not provided, all case_ functions will be run
-if len(sys.argv) < 2:
-    print("❌ Usage: python3 run_analysis.py <path_to_binary> [case_name]")
-    sys.exit(1)
-
-binary_path = sys.argv[1]
-binary_label = binary_path.split('/')[-1]
-specific_case = sys.argv[2] if len(sys.argv) >= 3 else None
-
 # number of instruction that can be executed in a speculative state
 SPECULATIVE_WINDOW = 200
+mask_sym = None
 
-# create an angr project from the binary
-proj = angr.Project(binary_path, auto_load_libs=False, default_analysis_mode='symbolic', use_sim_procedures=False)
+def parse_symbol(proj, name):
+    """Parses a symbol to match name of a symbol against its name in memory"""
+    # try to simply match the name in the cfg against memory
+    sym = proj.loader.main_object.get_symbol(name)
+    if sym is not None:
+        return sym
+    
+    # if the compiler added some suffix, try to find the original 
+    for sym in proj.loader.main_object.symbols:
+        if sym.name.startswith(name + "."):
+            return sym
+    
+    # if we haven't found it
+    return None
+def get_case_names(proj, specific_case=None):
+    """Collects the name of all the cases, if the user wants to analyze
+       only a specific case, return that one"""
+    all_cases = [
+        sym.name
+        for sym in proj.loader.main_object.symbols
+        if sym.name and sym.name.startswith("case_")
+    ]
+    if specific_case:
+        return [specific_case]
+    return sorted(all_cases)
 
-# create a symbolic memory from memsightpp
-CTMemory._set_memsight_ranges(proj)
+def parse_config(proj, cfg):
+    """Populate the dictionary with data from the config file"""
+    symbol_info = {}
+    mem_sections = ["public", "private"]
+    
+    # for both memory sections in config
+    for mem in mem_sections:
+        for entry in cfg[mem]:
+            # get the symbol from the memory
+            sym = parse_symbol(proj, entry["name"])
+            if sym is None:
+                raise RuntimeError(f"{mem} symbol `{entry['name']}` not found")
+            if entry["type"].endswith("[]"):
+                elem_size = {"uint8[]": 1}[entry["type"]]
+                length    = entry["length"]
+            else:
+                elem_size = {"uint8":1, "uint64":8}[entry["type"]]
+                length    = None
 
-# initialize a CFG and map addresses to function names
-cfg = proj.analyses.CFGFast(normalize=True)
-
-# gather all functions to analyze
-if specific_case:
-    case_names = [specific_case]
-else:
-    case_names = sorted(f.name for f in cfg.kb.functions.values() if f.name.startswith("case_"))
-
-# create a dictionary for results of functions
-results = defaultdict(lambda: {
-    "speculative": False,
-    "leakage": False,
-    "leak_depth": None,
-    "inputs": [],
-    "addrs": set(),
-    "I": None,
-    "Iunr": None,
-    "Time": None
-})
-
-# initialize public memory data
-public_sym = proj.loader.main_object.get_symbol("publicarray")
-public_array_sym = proj.loader.main_object.get_symbol("publicarray_size")
-mask_sym = proj.loader.main_object.get_symbol("publicarray_mask")
-public_addr = public_sym.rebased_addr
-public_size = public_sym.size
-public_size_addr = public_array_sym.rebased_addr
-
-# initialize secret memory data
-secret_sym = proj.loader.main_object.get_symbol("secretarray")
-secret_array_sym = proj.loader.main_object.get_symbol("publicarray_size")
-secret_addr = secret_sym.rebased_addr
-secret_size = secret_sym.size
-secret_size_addr = secret_array_sym.rebased_addr
+            # populate the symbol info dictionary
+            symbol_info[entry["name"]] = {
+                "addr":       sym.rebased_addr,
+                "elem_size":  elem_size,
+                "length":     length,
+                "kind":       mem,
+                "value":      entry.get("value", None)
+            }
+    return symbol_info
 
 def build_sec_mem_predicate(state, idx):
     """Build the predicate that needs to be satisfied for idx to reach secret memory"""
@@ -96,15 +90,21 @@ def build_sec_mem_predicate(state, idx):
         )
     state.globals["leak_pred"] = in_secret
 
-def has_branching(func):
-    """Check whether the test case has a conditional jump, which can be mis-predicted
-       This is a precondition for speculative execution 
-    """
-    for block_addr in func.block_addrs_set:
-        block = proj.factory.block(block_addr)
-        for insn in block.capstone.insns:
-            if capstone.CS_GRP_JUMP in insn.groups:
-                return True
+def dump_memory():
+    """Debug function for dumping memory"""
+    print("=== GLOBAL SYMBOLS ===")
+    for sym in proj.loader.main_object.symbols:
+        # only show symbols with a valid address
+        if sym.rebased_addr is not None:
+            print(f"{sym.name:30s} @ {hex(sym.rebased_addr)}")
+
+def has_branching(addr):
+    """Determine whether the case has conditional jumps"""
+    # disassemble the one block at addr and look for any jump opcodes
+    block = proj.factory.block(addr)
+    for insn in block.capstone.insns:
+        if capstone.CS_GRP_JUMP in insn.groups:
+            return True
     return False
 
 def record_branch_count(state):
@@ -130,6 +130,7 @@ def on_branch(state):
     cond = state.globals["guard"]
     addr = state.addr
 
+    speculated_branches = state.globals["speculated_branches"]
     # continue only if the branch wasn't already speculated on
     if cond is None or addr in speculated_branches:
         return
@@ -144,8 +145,6 @@ def on_branch(state):
     # retrieve the path predicates and create a new reference
     old_path_predicates = state.globals.get("path_predicates", [])
     new_path_pred = list(old_path_predicates)
-    # print("Path predicates before adding:")
-    # print_path_pred(old_path_predicates)
 
     # if this state represents true branch
     if target == true_target:
@@ -157,9 +156,6 @@ def on_branch(state):
     
     # append the new predicate and save it to globals
     new_path_pred.append(pred)
-    # print("Path predicates after adding")
-    # print_path_pred(new_path_pred)
-    # print("END OF PREDICATES\n\n")
     state.globals["path_predicates"] = new_path_pred
 
     # remove the constraint that was added by the conditional branch
@@ -207,7 +203,8 @@ def on_irsb(state):
     """Retrieve the publicarray mask and if this state is masking the index add is as a constraint"""
     addr = state.addr
     irsb = proj.factory.block(addr).vex
-    mask = state.globals.get('publicarray_mask')
+    mask = 16
+    idx = state.globals["idx"]
     
     # if there is no musk declared in the file don't add any constraints
     if mask is None:
@@ -226,6 +223,7 @@ def on_irsb(state):
 
 def check_secret_dependency(state, expr):
     """Check whether an expression is dependent on a secret"""
+    secret_symbols = state.globals["secret_symbols"]
     if len(secret_symbols) > 0:
         renamed_secrets = {secret.cache_key:
                            state.solver.BVV(0, secret.size()) for secret in secret_symbols}
@@ -245,15 +243,23 @@ def mark_as_leaky(state, addr):
        Afterwards, halt the execution of this state by moving it to deadended
     """
     leak_key = (state.addr, str(addr))
+    case_name = state.globals["case_name"]
+    simgr = state.globals["simgr"]
+    idx = state.globals["idx"]
+    results_map = state.globals["results"]
+    # grab the per‐case record
+    results = results_map[case_name]
 
     # we only have to determine if the function is leaky only once, if it's already leaky just skip
-    if leak_key not in results[case_name]["addrs"]:
-        results[case_name]["leakage"] = True
-        results[case_name]["speculative"] = True
-        results[case_name]["addrs"].add(state.addr)
-        concrete_idx = state.solver.eval(idx)
-        results[case_name].setdefault("inputs", []).append(hex(concrete_idx))
-        simgr.move('active', 'deadended', lambda s: True)
+    if leak_key in results["addrs"]:
+        return
+    
+    results["leakage"] = True
+    results["speculative"] = True
+    results["addrs"].add(state.addr)
+    concrete_idx = state.solver.eval(idx)
+    results.setdefault("inputs", []).append(hex(concrete_idx))
+    simgr.move('active', 'deadended', lambda s: True)
 
 
 def taint(state, expr):
@@ -283,12 +289,12 @@ def is_speculative_leak(state):
     # if the constraints are not satisfiable, we are in a speculative state
     return not state.solver.satisfiable(extra_constraints=[path_cond, in_secret])
 
-# keep only the first secret symbol description
 def strip_suffix(var):
+    """Strip the suffix of a variable which is assigned by the compiler"""
     return "_".join(var.split("_")[:2])
 
-# FOR DEBUG!
 def print_path_pred(pred_list):
+    """Debug function that prints the predicates of a path"""
     if len(pred_list) == 0:
         print("[]")
         print("-------------------------------------------------------------")
@@ -298,32 +304,41 @@ def print_path_pred(pred_list):
         print("-------------------------------------------------------------")
         counter+=1
 
-# run the whole process for every case sequentially
-for case_name in case_names:
-    func = cfg.kb.functions.function(name=case_name)
+def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
+    results = defaultdict(lambda: {
+        "speculative": False,
+        "leakage": False,
+        "leak_depth": None,
+        "inputs": [],
+        "addrs": set(),
+        "I": None,
+        "Iunr": None,
+        "Time": None
+    })
+
+    # run the whole process for every case sequentially
+    sym = parse_symbol(proj, case_name)
+    if sym is None:
+        raise RuntimeError(f"Couldn’t resolve {case_name}")
+    func_addr = sym.rebased_addr
+    # func = proj.kb.functions[case_name]
 
     # if there is no conditional jump, skip the test case
-    if not has_branching(func):
+    if not has_branching(func_addr):
         results[case_name]["speculative"] = False
         results[case_name]["leakage"] = False
         results[case_name]["I"] = 0
         results[case_name]["Iunr"] = 0
         results[case_name]["Time"] = 0.0
-        continue
+        return
 
-    # create symbolic input + taint sources
-    sym_input = claripy.BVS("input", 72) # 72-bit symbolic input
-    taint_sources = set(sym_input.variables)
-    
-    # create a set for branches that we have already speculated on
-    speculated_branches = set()
-
-    idx      = sym_input[63:] # attacker input
-    selector = sym_input[:64] # input for specific case
+    # create symbolic attacker input
+    sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
+    idx = sym_input
 
     SimState.register_default('memory', CTMemory)
 
-    state = state = proj.factory.call_state(func.addr, idx)
+    state = state = proj.factory.call_state(func_addr, idx)
     block = proj.factory.block(state.addr)
 
     # rewrite the memory to be fully symbolic
@@ -333,6 +348,12 @@ for case_name in case_names:
     
     # create the simulation manager
     simgr = proj.factory.simulation_manager(state)
+
+    # assign variables to state globals
+    state.globals["case_name"] = case_name
+    state.globals["simgr"] = simgr
+    state.globals["idx"] = idx
+    state.globals["results"] = results
 
     # flags set the same way as in memsightpp
     # add simulation options
@@ -355,42 +376,70 @@ for case_name in case_names:
     state.options.discard(angr.options.SIMPLIFY_EXPRS)
     state.options.discard(angr.options.SIMPLIFY_CONSTRAINTS)
 
-    # create a set for variables that are secret dependent
-    state.globals["secret_dependent_vars"] = set()
+    # get the address of the secretarray and its size and assign globals
+    secret_info = symbol_info["secretarray"] 
+    state.globals["secretarray_addr"] = secret_info["addr"]
+    state.globals["secretarray_size"] = secret_info["length"]
 
-    # get the address of the secretarray and determine its size
-    state.globals["secretarray_addr"] = secret_addr
-    state.globals["secretarray_size"] = secret_size
+    # get the address of the publicarray and its size and assign globals
+    public_info = symbol_info["publicarray"]
+    state.globals["publicarray_addr"] = public_info["addr"]
+    state.globals["publicarray_size"] = public_info["length"]
 
-    # get the address of the publicarray and determine its size, retrieve publicarray mask
-    state.globals["publicarray_addr"] = public_addr
-    state.globals["publicarray_size"] = public_size
-
-    # TODO for now this is a primitive solution, should make it more robust
-    if mask_sym is not None:
-        state.globals["publicarray_mask"] = public_size-1
-    
-    state.memory.store(public_size_addr,
-                   claripy.BVV(public_size, 64), endness=proj.arch.memory_endness)
-    state.memory.store(secret_size_addr,
-                    claripy.BVV(secret_size, 64), endness=proj.arch.memory_endness)
-
-    # initialize the path predicate
-    state.globals["path_predicates"] = []
-    
-    # initialize the secret_symbols set and populate it
+    # initialize secret symbols
     state.globals["secret_symbols"] = set()
     secret_symbols = state.globals["secret_symbols"]
-    for i in range(secret_size):
-        symb = claripy.BVS(f"secret_{i}", 8)
-        secret_symbols.add(symb)
-        state.memory.store(secret_addr + i, symb)
-    
-    # put symbolic values in publicarray
-    for i in range(public_size):
-        public_byte = claripy.BVS(f"public_{i}", 8)
-        state.memory.store(public_addr + i, public_byte)
 
+    # keep track of which branches you’ve already speculated on
+    state.globals["speculated_branches"] = set()
+
+    # initialize the path predicate and spec_instr_count
+    state.globals["path_predicates"] = []
+    state.globals["spec_instr_count"] = 0 
+
+    """For every memory data that we were given in the config
+       create symbolic variables and store them in memory
+    """
+    for name, info in symbol_info.items():
+        addr      = info["addr"]
+        elem_size = info["elem_size"]
+        length    = info["length"]
+        kind      = info["kind"]
+        val       = info["value"]
+        bits = elem_size * 8
+
+        # simple variables
+        if length is None:
+            if kind == "public" and val is not None:
+                sym = claripy.BVS(name, bits)
+                state.memory.store(addr, sym, endness=proj.arch.memory_endness)
+                concrete_bvv = claripy.BVV(val, bits)
+                pred = (sym == concrete_bvv)
+                
+                # only add non-trivial predicates so we don't change the outcome if the symbol is not used
+                if not pred.is_true() and not pred.is_false():
+                    state.globals["path_predicates"].append(pred)
+            elif kind == "public":
+                # no concrete value given? fall back to symbolic
+                bv = claripy.BVS(name, bits)
+                state.memory.store(addr, bv, endness=proj.arch.memory_endness)
+            else:
+                # private scalar
+                bv = claripy.BVS(f"_high_{name}", bits)
+                state.memory.store(addr, bv, endness=proj.arch.memory_endness)
+        # arrays
+        else:
+            for i in range(length):
+                elem_addr = addr + i * elem_size
+                if kind == "public":
+                    symb = claripy.BVS(f"public_{i}", bits)
+                    state.memory.store(elem_addr, symb, endness=proj.arch.memory_endness)
+                else:
+                    # private array element
+                    symb = claripy.BVS(f"secret_{i}", bits)
+                    secret_symbols.add(symb)
+                    state.memory.store(elem_addr, symb, endness=proj.arch.memory_endness)
+    
     # set a time limit for solving constraints
     state.solver.timeout = 1000
 
@@ -402,10 +451,9 @@ for case_name in case_names:
     state.inspect.b('exit', when=angr.BP_AFTER, action=on_branch) # triggers after branch is resolved
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
-    state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before an instruction block is executed
+    # state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before an instruction block is executed
 
     start_time = time.time()
-    speculative_instruction_count = 0
 
     # execute while there are active states
     while simgr.active:
@@ -413,9 +461,8 @@ for case_name in case_names:
         simgr.step()
 
         for state in simgr.active:
-            
+
             # if the state has exceeded the speculative window move it to deadened
-            spec_inst_count = state.globals.get("spec_instr_count", 0)
             if state.globals.get("spec_instr_count", 0) > SPECULATIVE_WINDOW:
                 preds = state.globals.get("path_predicates", [])
 
@@ -436,7 +483,6 @@ for case_name in case_names:
                             filter_func=lambda s: s is state)
                 else:
                     # this is the path taken by normal execution, reset the speculative window
-                    state.globals["path_predicates"] = []
                     state.globals["spec_instr_count"] = 0
 
             # if we have already detected a leakage, halt the execution
@@ -451,11 +497,7 @@ for case_name in case_names:
     end_time = time.time()
     results[case_name]["Time"] = end_time - start_time
 
-    # print("=== stash summary ===")
-    # for stash_name, stash_list in simgr.stashes.items():
-    #     print(f"  {stash_name:10s}: {len(stash_list)} state(s)")
-
-    # loop for every terminal state
+    # for every terminal state, populate results dict with the number of isnstruction executed
     for state in simgr.deadended:
         static_insns = set() # unique instructions
         total_insns = 0 # total number of instructions
@@ -465,62 +507,110 @@ for case_name in case_names:
             static_insns.update(insn.address for insn in block.capstone.insns)
         results[case_name]["I"] = len(static_insns)
         results[case_name]["Iunr"] = total_insns
+    return results[case_name]
 
-# print out the summary for each test case
-print("\n📊 === Summary by Function ===")
-for func_name in sorted(results):
-    res = results[func_name]
-    print(f"\n📌 {func_name}")
-    print(f"   - Speculative branch: {'✅' if res['speculative'] else '❌'}")
-    print(f"   - Leakage detected:   {'✅' if res['leakage'] else '❌'}")
-    if res["inputs"]:
-        for i, inp in enumerate(res["inputs"]):
-            print(f"     Input {i+1}: {inp}")
+def print_summary(results):
+    # print out the summary for each test case
+    print("\n📊 === Summary by Function ===")
+    for func_name in sorted(results):
+        res = results[func_name]
+        print(f"\n📌 {func_name}")
+        print(f"   - Speculative branch: {'✅' if res['speculative'] else '❌'}")
+        print(f"   - Leakage detected:   {'✅' if res['leakage'] else '❌'}")
+        inputs = res.get("inputs")
+        if isinstance(inputs, list) and inputs:
+            for i, inp in enumerate(inputs):
+                print(f"     Input {i+1}: {inp}")
+        else:
+            print("     Input: -")
 
-print(f"⏱️ Total combined analysis time: {sum(res['Time'] for res in results.values()):.2f} seconds")
+    # safely sum times, treating None as 0.0
+    total_time = sum((res.get("Time") or 0.0) for res in results.values())
+    print(f"⏱️ Total combined analysis time: {total_time:.2f} seconds")
 
 # write merged CSV output
 # this collects all case results into a single CSV file for easier comparison
-output_csv = f"/workspace/results/{binary_label}_results.csv"
-with open(output_csv, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Binary", "I", "Iunr", "Time", "Result"])
+def write_results(binary_label, binary_path, results):
+    output_csv = f"/workspace/results/{binary_label}_results.csv"
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Binary", "I", "Iunr", "Time", "Result"])
 
-    # summary row
-    total_I = 0
-    total_Iunr = 0
-    total_time = 0.0
-    has_insecure = False
-    for case_name in sorted(results, key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else float('inf')):
-        res = results[case_name]
-        verdict = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
-        input_val = res["inputs"][0] if res["inputs"] else "-"
-        result = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
-        I = res.get("I", 0)
-        Iunr = res.get("Iunr", 0)
-        time_val = round(res.get("Time", 0), 2)
+        # summary row
+        total_I = 0
+        total_Iunr = 0
+        total_time = 0.0
+        has_insecure = False
+        for case_name in sorted(results, key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else float('inf')):
+            res = results[case_name]
+            verdict = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
+            input_val = res["inputs"][0] if res["inputs"] else "-"
+            result = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
+            I = res.get("I", 0)
+            Iunr = res.get("Iunr", 0)
+            time_val = round(res.get("Time", 0), 2)
 
-        total_I += I if isinstance(I, int) else 0
-        total_Iunr += Iunr if isinstance(Iunr, int) else 0
-        total_time += time_val
-        if result == "Insecure":
-            has_insecure = True
+            total_I += I if isinstance(I, int) else 0
+            total_Iunr += Iunr if isinstance(Iunr, int) else 0
+            total_time += time_val
+            if result == "Insecure":
+                has_insecure = True
 
+            writer.writerow([
+                case_name,
+                I,
+                Iunr,
+                time_val,
+                result
+            ])
+
+        # write the final summary row with binary name
+        binary_label = binary_path.split('/')[-1]
+        summary_result = "Insecure" if has_insecure else "Secure"
         writer.writerow([
-            case_name,
-            I,
-            Iunr,
-            time_val,
-            result
+            binary_label,
+            total_I,
+            total_Iunr,
+            round(total_time, 2),
+            summary_result
         ])
 
-    # write the final summary row with binary name
+def main():
+    global proj
+    # check if there are enough arguments
+    if len(sys.argv) < 3:
+        print("Usage: python3 detector.py <binary> <config.json> [case_name]")
+        sys.exit(1)
+
+
+    binary_path  = sys.argv[1]
     binary_label = binary_path.split('/')[-1]
-    summary_result = "Insecure" if has_insecure else "Secure"
-    writer.writerow([
-        binary_label,
-        total_I,
-        total_Iunr,
-        round(total_time, 2),
-        summary_result
-    ])
+    config_path  = sys.argv[2]
+    specific_case = sys.argv[3] if len(sys.argv) >= 4 else None
+
+    with open(config_path) as file:
+        cfg = json.load(file)
+
+    proj = angr.Project(binary_path, auto_load_libs=False)
+    CTMemory._set_memsight_ranges(proj)
+    symbol_info = parse_config(proj, cfg)
+    case_names  = get_case_names(proj, specific_case)
+    results = {}
+    for case_name in case_names:
+        results[case_name] = analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW)
+    print(f"Calling print_summary with results: {results}")
+    print_summary(results)
+    write_results(binary_label, binary_path, results)
+
+if __name__ == "__main__":
+    # uncomment only for presenting results!!!
+    warnings.filterwarnings("ignore")
+    logging.getLogger("angr.state_plugins.symbolic_memory").setLevel(logging.ERROR)
+    logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.ERROR)
+
+    # suppress warnings from memsight
+    logging.getLogger("memsight").setLevel(logging.ERROR)
+
+    # suppress angr's unconstrained successor warnings
+    logging.getLogger("angr.engines.successors").setLevel(logging.ERROR)
+    main()
