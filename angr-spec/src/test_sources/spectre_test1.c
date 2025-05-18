@@ -10,7 +10,7 @@
 
 uint64_t publicarray_mask = 15;
 uint64_t publicarray_size = 16;
-uint8_t publicarray[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+uint8_t publicarray[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
 uint8_t publicarray2[512 * 256] = { 20 };
 
 // The attacker's goal in all of these examples is to learn any of the secret data in secretarray

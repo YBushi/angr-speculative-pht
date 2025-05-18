@@ -1,0 +1,50 @@
+{
+    "public": [
+      {
+        "name": "publicarray_mask",
+        "type": "uint64",
+        "value": 15
+      },
+      {
+        "name": "publicarray_size",
+        "type": "uint64",
+        "value": 16
+      },
+      {
+        "name": "publicarray",
+        "type": "uint8[]",
+        "length": 16
+      },
+      {
+        "name": "publicarray2",
+        "type": "uint8[]",
+        "length": 512,
+        "stride": 256
+      },
+      {
+        "name": "idx_is_safe",
+        "type": "uint8",
+        "value": 0
+      },
+      {
+        "name": "temp",
+        "type": "uint8",
+        "value": 0
+      }
+    ],
+    "private": [
+      {
+        "name": "secretarray_size",
+        "type": "uint64",
+        "prefix": "_high_",
+        "value": 16
+      },
+      {
+        "name": "secretarray",
+        "type": "uint8[]",
+        "length": 16,
+        "prefix": "_high_"
+      }
+    ]
+  }
+  
