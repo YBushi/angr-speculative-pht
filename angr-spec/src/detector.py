@@ -173,7 +173,7 @@ def add_mask(state):
     # if the idx is not used as a part of mem_read addr return
     if not contains_idx(addr, state.globals["idx"]):
         return
-
+    
     # add the mask
     idx = state.globals["idx"]
     mask_bvv = claripy.BVV(mask_val, idx.size())
@@ -186,7 +186,7 @@ def mem_read(state):
     """
     # before memory read, add a mask if there is one
     add_mask(state)
-
+    
     # get the address from which memory will be read
     addr = state.inspect.mem_read_address
 
@@ -195,33 +195,40 @@ def mem_read(state):
 
     if addr is None or expr is None:
         return
-    state.globals.get("leak_pred", claripy.false)
-    old_leak = state.globals["leak_pred"]
+    
+    idx = state.globals.get("idx")
+    if not contains_idx(addr, idx):
+       return
+
     base = state.globals["secretarray_addr"]
     size = state.globals["secretarray_size"]
     w    = addr.size()
     lo   = claripy.BVV(base, w)
     hi   = claripy.BVV(base + size, w)
-    this_leak = claripy.And(addr.UGE(lo), addr.ULT(hi))
-
-    new_leak = claripy.Or(old_leak, this_leak)
-    state.globals["leak_pred"] = new_leak
     
     # if we can access secret memory, taint the expression being read
-    in_secret = state.globals["leak_pred"]
+    in_secret = claripy.And(addr.UGE(lo), addr.ULT(hi))
     if state.solver.satisfiable(extra_constraints=[in_secret]):
         taint(state, expr)
+        """TODO: In here I have to check which addr has been tainted, after that 
+           when I am in is_speculative_leak I should check if that saved addr is used 
+           if yes then retrieve that in_secret predicate.
+        """
+        if "first_leak" not in state.globals:
+            state.globals["first_leak"] = (addr, in_secret)
 
     # if we have an expression dependent on secret, taint the expression
     if check_secret_dependency(state, expr):
         taint(state, expr)
+        if "first_leak" not in state.globals:
+            state.globals["first_leak"] = (addr, in_secret)
     
     # if the address isn't secret dependent we can return
     if not check_secret_dependency(state, addr):
         return
 
     # if the leak has occurred in a speculative state, mark as leaky and halt the execution
-    if is_speculative_leak(state):
+    if is_speculative_leak(state, addr):
         mark_as_leaky(state, addr)
         return
 
@@ -253,6 +260,15 @@ def mark_as_leaky(state, addr):
     simgr = state.globals["simgr"]
     idx = state.globals["idx"]
     results_map = state.globals["results"]
+    leak = state.globals.get("first_leak")
+    if leak is None:
+        return
+    addr, in_secret = leak
+
+    print(f"{case_name}_IN_SEC: {in_secret}")
+
+    s = claripy.Solver()
+    s.add(in_secret)
 
     # get the per‐case record
     results = results_map[case_name]
@@ -264,10 +280,9 @@ def mark_as_leaky(state, addr):
     results["leakage"] = True
     results["speculative"] = True
     results["addrs"].add(state.addr)
-    concrete_idx = state.solver.eval(idx)
+    concrete_idx = s.eval(idx, 1)[0]
     results.setdefault("inputs", []).append(hex(concrete_idx))
     simgr.move('active', 'deadended', lambda s: True)
-
 
 def taint(state, expr):
     """Add symbolic variables to the secret symbols"""
@@ -281,10 +296,15 @@ def taint(state, expr):
         if sym is not None and sym not in secret_symbols:
             secret_symbols.add(sym)
 
-def is_speculative_leak(state):
+def is_speculative_leak(state, addr):
     """Determine whether we are in a speculative state"""
     predicates = state.globals.get("path_predicates", [])
-    in_secret = state.globals["leak_pred"]
+    base = state.globals["secretarray_addr"]
+    size = state.globals["secretarray_size"]
+    w = addr.size()
+    lo = claripy.BVV(base, w)
+    hi = claripy.BVV(base + size, w)
+    in_secret = claripy.And(addr.UGE(lo), addr.ULT(hi))
     init_constraints = state.globals.get("init_constraints", [])
     
     # get the predicates from the dict
