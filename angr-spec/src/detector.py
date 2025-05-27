@@ -5,20 +5,22 @@ import csv
 import sys
 import re
 import capstone
+import argparse
 import copy
 import json
 from collections import defaultdict
-from angr.state_plugins.fully_symbolic_memory import FullySymbolicMemory
 import logging
 import warnings
 from angr.sim_state import SimState
 from ct_memory import CTMemory
 from claripy import UGE, ULT
-import pyvex
 
 # number of instruction that can be executed in a speculative state
 SPECULATIVE_WINDOW = 200
 counter = 0
+
+class StopAnalysis(Exception):
+    pass
 
 def parse_symbol(proj, name):
     """Parses a symbol to match name of a symbol against its name in memory"""
@@ -139,28 +141,42 @@ def on_branch(state):
     # if this state represent the false branch
     else:
         pred = claripy.Not(cond)
+
+    if state.globals.get("spec_ct", False):
+        instr_count = state.globals["spec_instr_count"]
+        new_path_pred.append({
+            "pred":       pred,
+            "count":      instr_count,
+        })
+        state.globals["path_predicates"] = new_path_pred
+
+        # remove the constraint that was added by the conditional branch
+        pre_count = state.globals.get("_pre_branch_count", 0)        
+        state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
+    else:
+        # remove the constraint that was added by the conditional branch
+        pre_count = state.globals.get("_pre_branch_count", 0)        
+        state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
+
+        # append the predicate to the committed constraints
+        old_com = state.globals["committed_predicates"]
+        new_com = list(old_com)
+        new_com.append(pred)
+        state.globals["committed_predicates"] = new_com
     
-    # if this is the first branch
-    if not state.globals["spec_started"]:
-        state.globals["spec_started"] = True
-        state.globals["spec_instr_count"] = 0
-
-    # if this is not the first branch
-    instr_count = state.globals["spec_instr_count"]
-    new_path_pred.append({
-        "pred":       pred,
-        "count":      instr_count,
-    })
-    state.globals["path_predicates"] = new_path_pred
-
-    # remove the constraint that was added by the conditional branch
-    pre_count = state.globals.get("_pre_branch_count", 0)        
-    state.solver._solver.constraints= state.solver._solver.constraints[:pre_count]
-
     # if the condition is not dependent on a secret, we can return
-    if check_secret_dependency(state, cond):
-        mark_as_leaky(state, addr)
+    if not check_secret_dependency(state, cond):
         return
+    
+    # if an OOB access is not possible in the condition, we can return
+    if not is_OOB_possible(state):
+        return
+    
+    if is_speculative_leak(state, addr):
+        mark_as_leaky(state, addr, True)
+        return
+    
+    mark_as_leaky(state, addr, False)
     
 def add_mask(state):
     addr = state.inspect.mem_read_address
@@ -171,7 +187,7 @@ def add_mask(state):
     tmp_name, mask_val = mask
 
     # if the idx is not used as a part of mem_read addr return
-    if not contains_idx(addr, state.globals["idx"]):
+    if not ast_contains(addr, state.globals["idx"]):
         return
     
     # add the mask
@@ -197,7 +213,7 @@ def mem_read(state):
         return
     
     idx = state.globals.get("idx")
-    if not contains_idx(addr, idx):
+    if not ast_contains(addr, idx):
        return
 
     base = state.globals["secretarray_addr"]
@@ -208,29 +224,76 @@ def mem_read(state):
     
     # if we can access secret memory, taint the expression being read
     in_secret = claripy.And(addr.UGE(lo), addr.ULT(hi))
+
+    # if OOB access is not possible return
+    if not is_OOB_possible(state):
+        return
+    
+    # check whether this memory read can point to secret memory
     if state.solver.satisfiable(extra_constraints=[in_secret]):
+        state.globals["in_secret"] = in_secret
         taint(state, expr)
-        """TODO: In here I have to check which addr has been tainted, after that 
-           when I am in is_speculative_leak I should check if that saved addr is used 
-           if yes then retrieve that in_secret predicate.
-        """
+        record_leak_pred(state, expr, in_secret)
         if "first_leak" not in state.globals:
             state.globals["first_leak"] = (addr, in_secret)
 
     # if we have an expression dependent on secret, taint the expression
     if check_secret_dependency(state, expr):
         taint(state, expr)
+        record_leak_pred(state, expr, in_secret)
         if "first_leak" not in state.globals:
             state.globals["first_leak"] = (addr, in_secret)
-    
+
     # if the address isn't secret dependent we can return
     if not check_secret_dependency(state, addr):
         return
-
-    # if the leak has occurred in a speculative state, mark as leaky and halt the execution
+    
+    # check whether the leak has occurred in a spec or non-spec state
     if is_speculative_leak(state, addr):
-        mark_as_leaky(state, addr)
+        print("Calling mark as leaky from spec_state!")
+        mark_as_leaky(state, addr, is_spec_state=True)
         return
+    
+    print("Calling mark as leaky from non_spec_state!")
+    mark_as_leaky(state, addr, is_spec_state=False)
+
+def record_leak_pred(state, value_ast, in_secret):
+    """Adds a unique leaked in_secret predicate to leak records"""
+    recs = state.globals.get("leak_records", [])
+
+    # only append a unique predicate
+    for v_ast, pred in recs:
+        if v_ast is value_ast and pred is in_secret:
+            return
+    recs.append((value_ast, in_secret))
+
+def is_OOB_possible(state):
+    """Check whether with the constraints known to the CPU, an OOB access is even possible"""
+    # get the committed constraints which represent the constraints known to the CPU
+    committed_preds = state.globals.get("committed_predicates", [])
+
+    # get initial constraints
+    init_constraints = state.globals.get("init_constraints", [])
+    addr = state.inspect.mem_read_address
+    value_ast, in_sec = find_record_for_OOB(state, addr)
+    print(in_sec)
+
+    # create a new fresh solver and determine whether we can have an OOB access
+    tmp_solver = claripy.Solver()
+    tmp_solver.add(committed_preds)
+    tmp_solver.add(init_constraints)
+    if in_sec is None:
+        in_sec = True
+
+    tmp_solver.add(in_sec)
+    return tmp_solver.satisfiable()
+
+def find_record_for_OOB(state, oob_addr):
+    """Check whether the oob_addr is inside the value AST"""
+    for value_ast, in_sec in state.globals.get("leak_records", []):
+        if ast_contains(oob_addr, value_ast):
+            return value_ast, in_sec
+    return None, None
 
 def check_secret_dependency(state, expr):
     """Check whether an expression is dependent on a secret"""
@@ -242,33 +305,26 @@ def check_secret_dependency(state, expr):
         expr_renamed = expr.replace_dict(renamed_secrets)
         return state.solver.satisfiable(extra_constraints=[expr != expr_renamed], exact=True)
 
-def count_speculative_instructions(state):
-    """Count the number of speculative instruction executed"""
-    if not state.globals["spec_started"]:
-        return
-    speculative_instruction_count = state.globals.get("spec_instr_count", 0)
-    block = proj.factory.block(state.addr)
-    speculative_instruction_count += len(block.capstone.insns)
-    state.globals["spec_instr_count"] = speculative_instruction_count
+def on_irsb(state):
+    """Ensure the VEX IR Super-Block is decoded and cached"""
+    proj.factory.block(state.addr)
     
-def mark_as_leaky(state, addr):
+def mark_as_leaky(state, addr, is_spec_state):
     """Mark the state as leaky and determine the attacker input that lead to this leakage
        Afterwards, halt the execution of this state by moving it to deadended
     """
     leak_key = (state.addr, str(addr))
     case_name = state.globals["case_name"]
-    simgr = state.globals["simgr"]
     idx = state.globals["idx"]
     results_map = state.globals["results"]
     leak = state.globals.get("first_leak")
+
     if leak is None:
         return
     addr, in_secret = leak
 
-    print(f"{case_name}_IN_SEC: {in_secret}")
-
-    s = claripy.Solver()
-    s.add(in_secret)
+    idx_solver = claripy.Solver()
+    idx_solver.add(in_secret)
 
     # get the per‐case record
     results = results_map[case_name]
@@ -277,12 +333,21 @@ def mark_as_leaky(state, addr):
     if leak_key in results["addrs"]:
         return
     
-    results["leakage"] = True
-    results["speculative"] = True
+    if state.globals.get("spec_ct", False):
+        if is_spec_state:
+            results["spec_insecure"] = True
+        else:
+            results["non_spec_insecure"] = True
+            results["spec_insecure"] = True
+    else:
+        if not is_spec_state:
+            results["non_spec_insecure"] = True
+
     results["addrs"].add(state.addr)
-    concrete_idx = s.eval(idx, 1)[0]
+    concrete_idx = idx_solver.eval(idx, 1)[0]
     results.setdefault("inputs", []).append(hex(concrete_idx))
-    simgr.move('active', 'deadended', lambda s: True)
+    print("MARKING AS LEAKY HALT THE EXECUTION!")
+    raise StopAnalysis()
 
 def taint(state, expr):
     """Add symbolic variables to the secret symbols"""
@@ -299,12 +364,7 @@ def taint(state, expr):
 def is_speculative_leak(state, addr):
     """Determine whether we are in a speculative state"""
     predicates = state.globals.get("path_predicates", [])
-    base = state.globals["secretarray_addr"]
-    size = state.globals["secretarray_size"]
-    w = addr.size()
-    lo = claripy.BVV(base, w)
-    hi = claripy.BVV(base + size, w)
-    in_secret = claripy.And(addr.UGE(lo), addr.ULT(hi))
+    in_secret = state.globals["in_secret"]
     init_constraints = state.globals.get("init_constraints", [])
     
     # get the predicates from the dict
@@ -317,16 +377,14 @@ def is_speculative_leak(state, addr):
             # in case you ever accidentally append a raw BoolRef
             preds.append(entry)
 
-    # build conjunction of predicates and initial constraints
-    if preds:
-        path_cond = preds[0]
-        for predicate in preds[1:] + init_constraints:
-            path_cond = state.solver.And(path_cond, predicate)
+    # build conjunction of predicates and initial constraint
+    all_constraints = preds + init_constraints
+    if all_constraints:
+        path_cond = state.solver.And(*all_constraints)
     else:
         path_cond = state.solver.true
-    # print(path_cond, in_secret)
 
-    # if the constraints are not satisfiable, we are in a speculative state
+    # now ask the solver if we are in a speculative state
     return not state.solver.satisfiable(extra_constraints=[path_cond, in_secret])
 
 def on_tmp_write(state):
@@ -351,10 +409,10 @@ def on_tmp_write(state):
         arg0, arg1 = expr.args
     
         # arg0 is input, so arg1 is the mask
-        if contains_idx(arg0, idx):
+        if ast_contains(arg0, idx):
             mask_sym    = arg1
             tmp_name = state.inspect.tmp_write_num
-        elif contains_idx(arg1, idx):
+        elif ast_contains(arg1, idx):
             mask_sym    = arg0
             tmp_name = state.inspect.tmp_write_num
         else:
@@ -364,12 +422,12 @@ def on_tmp_write(state):
         mask_val = state.solver.eval(mask_sym, extra_constraints = state.globals["init_constraints"])
         state.globals["pending_mask"] = (tmp_name, mask_val)
 
-def contains_idx(node, target):
-    """Check whether the AST node has idx inside it"""
+def ast_contains(node, target):
+    """Check whether the AST node has target inside it"""
     if node is target:
         return True
     for child in getattr(node, "args", ()):
-        if contains_idx(child, target):
+        if ast_contains(child, target):
             return True
     return False
 
@@ -388,11 +446,71 @@ def print_path_pred(pred_list):
         print("-------------------------------------------------------------")
         counter+=1
 
-def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
+def on_instruction(state):
+    predicate_dict = state.globals["path_predicates"]
+    # print(f"PRED DICT: {predicate_dict}")
+
+    # increase the instruction count
+    speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+    speculative_instruction_count += 1
+    # print(f"Number of instruction: {speculative_instruction_count}")
+    for path_predicate in predicate_dict:
+        if path_predicate["count"] <= speculative_instruction_count - SPECULATIVE_WINDOW:
+            print("OUT OF SPECULATIVE WINDOW!")
+            preds = [predicate["pred"] for predicate in predicate_dict]
+
+            # build conjunction (or “true” if empty)
+            if preds:
+                path_cond = preds[0]
+                for p in preds[1:]:
+                    path_cond = state.solver.And(path_cond, p)
+            else:
+                path_cond = state.solver.true
+
+            """If the path predicate is unsatisfiable, we are in a speculative state
+            This state has passed it's speculative window and has been rolled back
+            """
+            current_constraints = list(state.solver.constraints) + [path_cond]
+            if not state.solver.satisfiable(extra_constraints=current_constraints):     
+                print("Path is unsatisfiable, add False to constraints, kill the state!")      
+                state.add_constraints(claripy.false)
+            else:
+                print("Path is satisfiable!")
+                # this is the path taken by normal execution
+                # remove the oldest branch predicate and extend the speculative window
+                if predicate_dict:
+                    last = predicate_dict.pop(0)
+                    # state.add_constraints(last["pred"])
+                    old_com = state.globals["committed_predicates"]
+                    new_com = list(old_com)
+                    new_com.append(last["pred"])
+                    state.globals["committed_predicates"] = new_com
+                    # print(f"ADDING CONSTRAINTS: {last['pred']} to committed pred")
+
+    state.globals["spec_instr_count"] = speculative_instruction_count
+    # com = state.globals.get("committed_predicates", [])
+    # print(f"COMMITTED PRED: {com}")
+    # tmp_solver = claripy.Solver()
+    # tmp_solver.add(com)
+    # print(f"IS PATH SATISFIABLE: {tmp_solver.satisfiable()}")
+    # print("==============================================================")
+
+def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW, check_spec_ct = False):
+    # run the whole process for every case sequentially
+    sym = parse_symbol(proj, case_name)
+    if sym is None:
+        raise RuntimeError(f"Couldn’t resolve {case_name}")
+    func_addr = sym.rebased_addr
+
+    # create symbolic attacker input
+    sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
+    idx = sym_input
+
+    state = state = proj.factory.call_state(func_addr, idx)
+    block = proj.factory.block(state.addr)
     results = defaultdict(lambda: {
-        "speculative": False,
-        "leakage": False,
-        "leak_depth": None,
+        "spec_insecure": False,
+        "non_spec_insecure": False,
         "inputs": [],
         "addrs": set(),
         "I": None,
@@ -400,29 +518,15 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
         "Time": None
     })
 
-    # run the whole process for every case sequentially
-    sym = parse_symbol(proj, case_name)
-    if sym is None:
-        raise RuntimeError(f"Couldn’t resolve {case_name}")
-    func_addr = sym.rebased_addr
-
-    # if there is no conditional jump, skip the test case
-    if not has_branching(func_addr):
-        results[case_name]["speculative"] = False
-        results[case_name]["leakage"] = False
-        results[case_name]["I"] = 0
-        results[case_name]["Iunr"] = 0
-        results[case_name]["Time"] = 0.0
-        return
-
-    # create symbolic attacker input
-    sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
-    idx = sym_input
+    if not check_spec_ct: 
+        # if there is no conditional jump, skip the test case
+        if not has_branching(func_addr):
+            results[case_name]["I"] = 0
+            results[case_name]["Iunr"] = 0
+            results[case_name]["Time"] = 0.0
+            return results[case_name]
 
     SimState.register_default('memory', CTMemory)
-
-    state = state = proj.factory.call_state(func_addr, idx)
-    block = proj.factory.block(state.addr)
 
     # rewrite the memory to be fully symbolic
     ct_mem = CTMemory(endness=proj.arch.memory_endness)
@@ -437,10 +541,11 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
     state.globals["simgr"] = simgr
     state.globals["idx"] = idx
     state.globals["results"] = results
-    state.globals["spec_started"] = False
     state.globals["spec_instr_count"] = 0
     state.globals['leak_pred'] = claripy.false
     state.globals["mask"] = None
+    state.globals["in_secret"] = None
+    state.globals["spec_ct"] = check_spec_ct
 
     # flags set the same way as in memsightpp
     # add simulation options
@@ -480,7 +585,9 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
     # keep track of which branches you’ve already speculated on
     state.globals["speculated_branches"] = set()
     state.globals["path_predicates"] = []
+    state.globals["committed_predicates"] = []
     state.globals["init_constraints"] = []
+    state.globals["leak_records"] = []
 
     """For every memory data that we were given in the config
        create symbolic variables and store them in memory
@@ -533,57 +640,19 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
     # hooks
     state.inspect.b('exit', when=angr.BP_BEFORE, action=record_branch_count) # triggers after branch is resolved
     state.inspect.b('exit', when=angr.BP_AFTER, action=on_branch) # triggers after branch is resolved
-    state.inspect.b('irsb', when=angr.BP_BEFORE, action=count_speculative_instructions) # triggers before basic block execution
+    state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
     state.inspect.b('tmp_write', when=angr.BP_BEFORE, action=on_tmp_write) # triggers before a write to tmp
+    state.inspect.b('instruction', when=angr.BP_BEFORE, action=on_instruction) # triggers before every instruction
 
     start_time = time.time()
 
-    # execute while there are active states
-    while simgr.active:
-        # advance states
-        simgr.step()
-        for state in simgr.active:
-            # if the state has exceeded the speculative window move it to deadened
-            if state.globals.get("spec_instr_count", 0) > SPECULATIVE_WINDOW:
-                predicate_dict = state.globals["path_predicates"]
-                preds = [predicate["pred"] for predicate in predicate_dict]
-                # build conjunction (or “true” if empty)
-                if preds:
-                    path_cond = preds[0]
-                    for p in preds[1:]:
-                        path_cond = state.solver.And(path_cond, p)
-                else:
-                    path_cond = state.solver.true
-
-                """If the path predicate is unsatisfiable, we are in a speculative state
-                   This state has passed it's speculative window and has been rolled back
-                """
-                if not state.solver.satisfiable(extra_constraints=[path_cond]):                    
-                    # move the state to deadended
-                    simgr.move(from_stash='active', to_stash='deadended',
-                            filter_func=lambda s: s is state)
-                else:
-                    # this is the path taken by normal execution
-
-                    # remove the oldest branch predicate and extend the speculative window
-                    last = predicate_dict.pop(0)
-                    refunded = last["count"] 
-                    state.globals["spec_instr_count"] -= refunded
-
-                    # if there are no predicates left, just reset the whole window
-                    if not predicate_dict:
-                        state.globals["spec_started"] = False
-
-            # if we have already detected a leakage, halt the execution
-            if results[case_name]["leakage"]:
-                simgr.move(
-                    from_stash='active',
-                    to_stash='deadended',
-                    filter_func=lambda s: True
-                )
-                break
-
+    # run the simulator
+    try:
+        simgr.run()
+    except StopAnalysis:
+        print("⚠️  Leak detected — aborting simulation early.")
+        simgr.move('active', 'deadended', lambda s: True)
     # dump_stashes(simgr)
 
     end_time = time.time()
@@ -601,14 +670,17 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW):
         results[case_name]["Iunr"] = total_insns
     return results[case_name]
 
-def print_summary(results):
+def print_summary(results, check_spec_ct):
     # print out the summary for each test case
     print("\n📊 === Summary by Function ===")
     for func_name in sorted(results):
         res = results[func_name]
         print(f"\n📌 {func_name}")
-        print(f"   - Speculative branch: {'✅' if res['speculative'] else '❌'}")
-        print(f"   - Leakage detected:   {'✅' if res['leakage'] else '❌'}")
+        if check_spec_ct:
+            print(f"   - Speculative-execution CT: {'🚨 Insecure' if res['spec_insecure'] else '🔒 Secure'}")
+            print(f"   - Normal-execution CT: {'🚨 Insecure' if res['non_spec_insecure'] else '🔒 Secure'}")
+        else:
+            print(f"   - Normal-execution CT: {'🚨 Insecure' if res['non_spec_insecure'] else '🔒 Secure'}")
         inputs = res.get("inputs")
         if isinstance(inputs, list) and inputs:
             for i, inp in enumerate(inputs):
@@ -644,9 +716,7 @@ def write_results(binary_label, binary_path, results):
         has_insecure = False
         for case_name in sorted(results, key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else float('inf')):
             res = results[case_name]
-            verdict = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
-            input_val = res["inputs"][0] if res["inputs"] else "-"
-            result = "Insecure" if res["leakage"] or res["speculative"] else "Secure"
+            result = "Insecure" if res["spec_insecure"] else "Secure"
             I = res.get("I", 0)
             Iunr = res.get("Iunr", 0)
             time_val = round(res.get("Time", 0), 2)
@@ -678,16 +748,27 @@ def write_results(binary_label, binary_path, results):
 
 def main():
     global proj
-    # check if there are enough arguments
-    if len(sys.argv) < 3:
-        print("Usage: python3 detector.py <binary> <config.json> [case_name]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Detect CT/speculative-CT violations in a binary"
+    )
+    parser.add_argument("binary",          help="path to the binary under test")
+    parser.add_argument("config",          help="JSON config of all your test cases")
+    parser.add_argument(
+        "case_name", nargs="?", default=None,
+        help="(optional) run only this one case"
+    )
+    parser.add_argument(
+        "--spec-ct",
+        action="store_true",
+        help="also check normal (in-order) constant-time violations, not just speculative"
+    )
 
-
-    binary_path  = sys.argv[1]
+    args = parser.parse_args()
+    binary_path   = args.binary
+    config_path   = args.config
+    specific_case = args.case_name
+    check_spec_ct  = args.spec_ct
     binary_label = binary_path.split('/')[-1]
-    config_path  = sys.argv[2]
-    specific_case = sys.argv[3] if len(sys.argv) >= 4 else None
 
     # load up the config file
     with open(config_path) as file:
@@ -701,10 +782,17 @@ def main():
 
     # analyze every case sequentially
     for case_name in case_names:
-        results[case_name] = analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW)
+    # pass the flag down into analyze_case
+        results[case_name] = analyze_case(
+            proj,
+            symbol_info,
+            case_name,
+            SPECULATIVE_WINDOW,
+            check_spec_ct=check_spec_ct
+        )
     
     # print the summary and create a csv file with the results
-    print_summary(results)
+    print_summary(results, check_spec_ct)
     write_results(binary_label, binary_path, results)
 
 if __name__ == "__main__":
@@ -712,6 +800,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     logging.getLogger("angr.state_plugins.symbolic_memory").setLevel(logging.ERROR)
     logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.ERROR)
+    logging.getLogger("angr.engines.vex.engine").setLevel(logging.ERROR)
 
     # suppress warnings from memsight
     logging.getLogger("memsight").setLevel(logging.ERROR)

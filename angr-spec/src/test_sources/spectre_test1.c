@@ -21,7 +21,7 @@ volatile uint8_t temp = 0;
 // 🔥 classic leaky Spectre v1
 void case_0(uint64_t idx) {
     if (idx < publicarray_size) {
-        temp &= publicarray2[secretarray[idx] * 512];
+        temp &= publicarray2[publicarray[idx] * 512];
         return;
     }
 }
@@ -29,7 +29,123 @@ void case_0(uint64_t idx) {
 // ✅ safe — uses masking to avoid OOB access
 void case_1(uint64_t idx) {
     if (idx < publicarray_size) {
-        temp &= publicarray2[publicarray[idx] * 512];
+        // ——— pad out exactly 20 instructions ———
+        __asm__ __volatile__(
+            "nop\n\t"  // 1
+            "nop\n\t"  // 2
+            "nop\n\t"  // 3
+            "nop\n\t"  // 4
+            "nop\n\t"  // 5
+            "nop\n\t"  // 6
+            "nop\n\t"  // 7
+            "nop\n\t"  // 8
+            "nop\n\t"  // 9
+            "nop\n\t"  // 10
+            "nop\n\t"  // 11
+            "nop\n\t"  // 12
+            "nop\n\t"  // 13
+            "nop\n\t"  // 14
+            "nop\n\t"  // 15
+            "nop\n\t"  // 16
+            "nop\n\t"  // 17
+            "nop\n\t"  // 18
+            "nop\n\t"  // 19
+            "nop\n\t"  // 20
+        );
+        if (idx < publicarray_size) {
+            __asm__ __volatile__(
+                "nop\n\t"  // 1
+                "nop\n\t"  // 2
+                "nop\n\t"  // 3
+                "nop\n\t"  // 4
+                "nop\n\t"  // 5
+                "nop\n\t"  // 6
+                "nop\n\t"  // 7
+                "nop\n\t"  // 8
+                "nop\n\t"  // 9
+                "nop\n\t"  // 10
+                "nop\n\t"  // 11
+                "nop\n\t"  // 12
+                "nop\n\t"  // 13
+                "nop\n\t"  // 14
+                "nop\n\t"  // 15
+                "nop\n\t"  // 16
+                "nop\n\t"  // 17
+                "nop\n\t"  // 18
+                "nop\n\t"  // 19
+                "nop\n\t"  // 20
+            );
+        }
+        if (idx >= publicarray_size) {
+            //give me a code that makes 20 instructions
+            __asm__ __volatile__(
+                "nop\n\t"  // 1
+                "nop\n\t"  // 2
+                "nop\n\t"  // 3
+                "nop\n\t"  // 4
+                "nop\n\t"  // 5
+                "nop\n\t"  // 6
+                "nop\n\t"  // 7
+                "nop\n\t"  // 8
+                "nop\n\t"  // 9
+                "nop\n\t"  // 10
+                "nop\n\t"  // 11
+                "nop\n\t"  // 12
+                "nop\n\t"  // 13
+                "nop\n\t"  // 14
+                "nop\n\t"  // 15
+                "nop\n\t"  // 16
+                "nop\n\t"  // 17
+                "nop\n\t"  // 18
+                "nop\n\t"  // 19
+                "nop\n\t"  // 20
+            );
+            __asm__ __volatile__(
+                "nop\n\t"  // 1
+                "nop\n\t"  // 2
+                "nop\n\t"  // 3
+                "nop\n\t"  // 4
+                "nop\n\t"  // 5
+                "nop\n\t"  // 6
+                "nop\n\t"  // 7
+                "nop\n\t"  // 8
+                "nop\n\t"  // 9
+                "nop\n\t"  // 10
+                "nop\n\t"  // 11
+                "nop\n\t"  // 12
+                "nop\n\t"  // 13
+                "nop\n\t"  // 14
+                "nop\n\t"  // 15
+                "nop\n\t"  // 16
+                "nop\n\t"  // 17
+                "nop\n\t"  // 18
+                "nop\n\t"  // 19
+                "nop\n\t"  // 20
+            );
+            __asm__ __volatile__(
+                "nop\n\t"  // 1
+                "nop\n\t"  // 2
+                "nop\n\t"  // 3
+                "nop\n\t"  // 4
+                "nop\n\t"  // 5
+                "nop\n\t"  // 6
+                "nop\n\t"  // 7
+                "nop\n\t"  // 8
+                "nop\n\t"  // 9
+                "nop\n\t"  // 10
+                "nop\n\t"  // 11
+                "nop\n\t"  // 12
+                "nop\n\t"  // 13
+                "nop\n\t"  // 14
+                "nop\n\t"  // 15
+                "nop\n\t"  // 16
+                "nop\n\t"  // 17
+                "nop\n\t"  // 18
+                "nop\n\t"  // 19
+                "nop\n\t"  // 20
+            );
+            temp &= publicarray2[publicarray[idx] * 512];
+        }
     }
 }
 
@@ -104,7 +220,7 @@ int case_10(uint64_t idx) {
 
 // This case is not leaky, because the speculative window expires before the mem_read is reached
 void case_11(uint64_t idx) {
-    if (idx < publicarray_size) {
+    if (idx >= publicarray_size) {
         temp &= publicarray2[publicarray[idx] * 512];
     }
 }
