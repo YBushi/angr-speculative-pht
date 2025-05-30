@@ -14,7 +14,6 @@ import warnings
 from angr.sim_state import SimState
 from ct_memory import CTMemory
 from claripy import UGE, ULT
-from angr.analyses.calling_convention import CallingConventionAnalysis
 
 # number of instruction that can be executed in a speculative state
 SPECULATIVE_WINDOW = 200
@@ -40,7 +39,8 @@ def parse_symbol(proj, name):
 
 def get_case_names(proj, specific_case=None):
     """Collects the name of all the cases, if the user wants to analyze
-       only a specific case, return that one"""
+       only a specific case, return that one
+    """
     all_cases = [
         sym.name
         for sym in proj.loader.main_object.symbols
@@ -165,7 +165,6 @@ def on_branch(state):
     
     for value_ast, in_secret in state.globals["leak_records"]:
         if ast_contains(cond_ast, value_ast):
-            # found your matching value_ast
             break
     
     if is_speculative_leak(state, addr):
@@ -366,11 +365,9 @@ def is_speculative_leak(state, addr):
     # get the predicates from the dict
     preds = []
     for entry in predicates:
-        # only dicts with a "pred" key
         if isinstance(entry, dict) and "pred" in entry:
             preds.append(entry["pred"])
         else:
-            # in case you ever accidentally append a raw BoolRef
             preds.append(entry)
 
     if preds is None:
@@ -386,7 +383,6 @@ def on_tmp_write(state):
         """Triggers on write into temp. Used for detecting masking"""
         # get the expression written to temp
         expr = state.inspect.tmp_write_expr  
-
         args = state.globals["args"]
 
         if expr.op != "__and__" or len(expr.args) != 2:
@@ -454,10 +450,9 @@ def on_instruction(state):
     """
     solver = state.globals['solver']
     if not solver.satisfiable(extra_constraints=path_cond):     
-        print("Path is unsatisfiable, add False to constraints, kill the state!")      
+        # path is unsatisfiable, add False to constraints, kill the state! 
         state.add_constraints(claripy.false)
     else:
-        print("Path is satisfiable!")
         # this is the path taken by normal execution
         for pred in preds:
             state.globals["solver"].add(pred)
@@ -469,12 +464,9 @@ def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, che
         raise RuntimeError(f"Couldn’t resolve {case_name}")
     func_addr = sym.rebased_addr
 
-    # create symbolic attacker input
-    # sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
-    # idx = sym_input
+    # create symbolic attacker-controlled arguments
     n_args = args_map.get(case_name, 1)
     args = [claripy.BVS(f"{case_name}_arg{i}", 64) for i in range(n_args)]
-    print(f"ARGUMENTS: {args}")
     state = proj.factory.call_state(func_addr, *args)
 
     # create the dictionary for results
@@ -579,6 +571,7 @@ def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, che
                 # only add non-trivial predicates so we don't change the outcome if the symbol is not used
                 if not pred.is_true() and not pred.is_false():
                     state.globals["init_constraints"].append(pred)
+
             elif kind == "public":
                 # no concrete value given? fall back to symbolic
                 bv = claripy.BVS(name, bits)
@@ -794,7 +787,7 @@ def main():
             args_map,
             case_name,
             SPECULATIVE_WINDOW,
-            check_spec_ct=check_spec_ct
+            check_spec_ct
         )
     
     # print the summary and create a csv file with the results
