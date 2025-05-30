@@ -13,11 +13,11 @@ Enable: "Use Rosetta for x86/amd64 emulation"
 Enable: "Use the Apple Virtualization framework"  
 Enable QEMU emulation: <pre>docker run --rm --privileged tonistiigi/binfmt --install all"</pre>
 Build the container: <pre>docker buildx build --platform linux/amd64 -t angr-spec --load ."</pre>
-<pre> Run the container: docker run -it --platform=linux/amd64 -v "$(pwd)":/workspace -w /workspace angr-spec</pre>
+Run the container: <pre>docker run -it --platform=linux/amd64 -v "$(pwd)":/workspace -w /workspace angr-spec</pre>
 #### Windows with WSL2
 Enable QEMU emulation: <pre>docker run --rm --privileged tonistiigi/binfmt --install all"</pre>
 Build the container: <pre>docker buildx build --platform linux/amd64 -t angr-spec --load ."</pre>
-<pre> docker run -it --platform=linux/amd64 -v "$(pwd)":/workspace -w /workspace angr-spec</pre>
+Run the container: <pre> docker run -it --platform=linux/amd64 -v "$(pwd)":/workspace -w /workspace angr-spec</pre>
 ## Compiling 
 To compile a c-file from test_sources run command: gcc -fno-pie -no-pie -O0 -o ../test_binaries/output_binary your_file.c
 ## Testing
