@@ -754,13 +754,21 @@ def write_results(binary_label, binary_path, results, spec_ct_enabled):
 
 def main():
     global proj
+    
+    # parse the optional specific case argument
+    for arg in sys.argv:
+        if arg.startswith("--case_"):
+            sys.argv += ["--case_name", arg.replace("--", "")]
+            sys.argv.remove(arg)
+            break 
+
     parser = argparse.ArgumentParser(
         description="Detect CT/speculative-CT violations in a binary"
     )
     parser.add_argument("binary",          help="path to the binary under test")
     parser.add_argument("config",          help="JSON config of all your test cases")
     parser.add_argument(
-        "case_name", nargs="?", default=None,
+        "--case_name", nargs="?", default=None,
         help="(optional) run only this one case"
     )
     parser.add_argument(
