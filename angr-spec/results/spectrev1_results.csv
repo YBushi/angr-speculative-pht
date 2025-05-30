@@ -1,3 +1,18 @@
 Binary,Instructions,Time,Non-Speculative Execution,Speculative Execution
-spectrev1_case_1,7,1.49,Secure,Insecure
-summary_spectrev1,7,1.49,Secure,Insecure
+spectrev1_case_1,7,1.83,Secure,Insecure
+spectrev1_case_2,15,1.75,Secure,Insecure
+spectrev1_case_3,15,1.5,Secure,Insecure
+spectrev1_case_4,8,1.87,Secure,Insecure
+spectrev1_case_5,13,1.09,Secure,Insecure
+spectrev1_case_6,11,2.11,Secure,Insecure
+spectrev1_case_7,7,1.97,Secure,Insecure
+spectrev1_case_8,7,2.39,Insecure,Insecure
+spectrev1_case_9,7,0.72,Secure,Insecure
+spectrev1_case_10,9,1.26,Secure,Insecure
+spectrev1_case_11gcc,37,1.65,Secure,Insecure
+spectrev1_case_11ker,35,2.46,Secure,Insecure
+spectrev1_case_11sub,36,2.33,Secure,Insecure
+spectrev1_case_12,11,2.25,Secure,Insecure
+spectrev1_case_13,13,2.53,Secure,Insecure
+spectrev1_case_14,10,2.06,Secure,Insecure
+summary_spectrev1,241,29.77,Insecure,Insecure

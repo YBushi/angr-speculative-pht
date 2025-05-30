@@ -14,6 +14,7 @@ import warnings
 from angr.sim_state import SimState
 from ct_memory import CTMemory
 from claripy import UGE, ULT
+from angr.analyses.calling_convention import CallingConventionAnalysis
 
 # number of instruction that can be executed in a speculative state
 SPECULATIVE_WINDOW = 200
@@ -76,7 +77,7 @@ def parse_config(proj, cfg):
                 "kind":       mem,
                 "value":      entry.get("value", None)
             }
-    return symbol_info
+    return symbol_info, cfg.get("N_args", {})
 
 def dump_memory():
     """Debug function for dumping memory"""
@@ -181,17 +182,17 @@ def add_mask(state):
     
     tmp_name, mask_val = mask
 
-    # if the idx is not used as a part of mem_read addr return
-    if not ast_contains(addr, state.globals["idx"]):
+    # if any of the arguments is not used as an address, return
+    if not any(ast_contains(addr, arg) for arg in state.globals["args"]):
         return
     
     # add the mask
-    idx = state.globals["idx"]
-    mask_bvv = claripy.BVV(mask_val, idx.size())
-    state.add_constraints((idx & ~mask_bvv) == 0)
-    if not state.solver.satisfiable():
-        print(f"[!] Mask {mask_val:#x} just UNSAT’ed state at 0x{state.addr:x}")
-    state.globals["solver"].add((idx & ~mask_bvv) == 0)
+    for idx in state.globals["args"]:
+        if ast_contains(addr, idx):
+            mask_bvv = claripy.BVV(mask_val, idx.size())
+            constraint = (idx & ~mask_bvv) == 0
+            state.add_constraints(constraint)
+            state.globals["solver"].add(constraint)
 
 def mem_read(state):
     """Before a memory read, check whether secret memory can be accessed
@@ -210,8 +211,8 @@ def mem_read(state):
     if addr is None or expr is None:
         return
     
-    idx = state.globals.get("idx")
-    if not ast_contains(addr, idx):
+    # if the address doesn't include a single attacker-controlled argument, return
+    if not any(ast_contains(addr, arg) for arg in state.globals["args"]):
        return
 
     base = state.globals["secretarray_addr"]
@@ -301,7 +302,6 @@ def mark_as_leaky(state, addr, is_spec_state, branch_leak=False, branch_sec=None
     """
     leak_key = (state.addr, str(addr))
     case_name = state.globals["case_name"]
-    idx = state.globals["idx"]
     results_map = state.globals["results"]
     leak_recs = state.globals.get("leak_records")
     addr = state.inspect.mem_read_address
@@ -340,8 +340,9 @@ def mark_as_leaky(state, addr, is_spec_state, branch_leak=False, branch_sec=None
             results["non_spec_insecure"] = True
 
     results["addrs"].add(state.addr)
-    concrete_idx = idx_solver.eval(idx, 1)[0]
-    results.setdefault("inputs", []).append(hex(concrete_idx))
+    args = state.globals["args"]
+    concrete_inputs = [hex(idx_solver.eval(arg, 1)[0]) for arg in args]
+    results.setdefault("inputs", []).append(concrete_inputs)
     raise StopAnalysis()
 
 def taint(state, expr):
@@ -386,31 +387,27 @@ def on_tmp_write(state):
         # get the expression written to temp
         expr = state.inspect.tmp_write_expr  
 
-        # get the name of the idx
-        idx = state.globals.get("idx")
+        args = state.globals["args"]
 
-        if expr.size() != idx.size():
+        if expr.op != "__and__" or len(expr.args) != 2:
             return
 
-        # determine whether this is a bitwiseAND operation
-        if expr.op != "__and__":
-            return
-
-        # check if there are 2 arguments in the operation
-        if len(expr.args) != 2:
-            return
-        
         arg0, arg1 = expr.args
-    
-        # arg0 is input, so arg1 is the mask
-        if ast_contains(arg0, idx):
-            mask_sym    = arg1
-            tmp_name = state.inspect.tmp_write_num
-        elif ast_contains(arg1, idx):
-            mask_sym    = arg0
-            tmp_name = state.inspect.tmp_write_num
+
+        for idx in args:
+            if expr.size() != idx.size():
+                continue
+
+            if ast_contains(arg0, idx):
+                mask_sym = arg1
+                tmp_name = state.inspect.tmp_write_num
+                break
+            elif ast_contains(arg1, idx):
+                mask_sym = arg0
+                tmp_name = state.inspect.tmp_write_num
+                break
         else:
-            return
+            return 
         
         # determine the mask val and add it as a pending mask that should be added later
         mask_val = state.solver.eval(mask_sym, extra_constraints = state.globals["init_constraints"])
@@ -442,42 +439,30 @@ def print_path_pred(pred_list):
 
 def on_instruction(state):
     predicate_dict = state.globals["path_predicates"]
-
     # increase the instruction count
     speculative_instruction_count = state.globals.get("spec_instr_count", 0)
     speculative_instruction_count += 1
-    
-    # check for each path predicate whether it is still inside the speculative window
-    for path_predicate in predicate_dict:
-        if path_predicate["count"] <= speculative_instruction_count - SPECULATIVE_WINDOW:
-            preds = [predicate["pred"] for predicate in predicate_dict]
-
-            # build conjunction (or “true” if empty)
-            if preds:
-                path_cond = preds[0]
-                for pred in preds[1:]:
-                    path_cond = state.solver.And(path_cond, pred)
-            else:
-                path_cond = state.solver.true
-
-            """If the path predicate is unsatisfiable, we are in a speculative state
-            This state has passed it's speculative window and has been rolled back
-            """
-            solver = state.globals['solver']
-            if not solver.satisfiable(extra_constraints=path_cond):     
-                print("Path is unsatisfiable, add False to constraints, kill the state!")      
-                state.add_constraints(claripy.false)
-            else:
-                print("Path is satisfiable!")
-                # this is the path taken by normal execution
-                # remove the oldest branch predicate and extend the speculative window
-                if predicate_dict:
-                    last = predicate_dict.pop(0)
-                    state.globals["solver"].add(last[pred])
-
     state.globals["spec_instr_count"] = speculative_instruction_count
 
-def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW, check_spec_ct = False):
+    preds = [predicate["pred"] for predicate in predicate_dict if predicate["count"] <= speculative_instruction_count - SPECULATIVE_WINDOW]
+    if not preds:
+        return
+    path_cond = state.solver.And(*preds)
+    
+    """If the path predicate is unsatisfiable, we are in a speculative state
+    This state has passed it's speculative window and has been rolled back
+    """
+    solver = state.globals['solver']
+    if not solver.satisfiable(extra_constraints=path_cond):     
+        print("Path is unsatisfiable, add False to constraints, kill the state!")      
+        state.add_constraints(claripy.false)
+    else:
+        print("Path is satisfiable!")
+        # this is the path taken by normal execution
+        for pred in preds:
+            state.globals["solver"].add(pred)
+
+def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, check_spec_ct = False):
     # run the whole process for every case sequentially
     sym = parse_symbol(proj, case_name)
     if sym is None:
@@ -485,11 +470,14 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW, check_spec_ct
     func_addr = sym.rebased_addr
 
     # create symbolic attacker input
-    sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
-    idx = sym_input
+    # sym_input = claripy.BVS("input", 64) # 64-bit symbolic input
+    # idx = sym_input
+    n_args = args_map.get(case_name, 1)
+    args = [claripy.BVS(f"{case_name}_arg{i}", 64) for i in range(n_args)]
+    print(f"ARGUMENTS: {args}")
+    state = proj.factory.call_state(func_addr, *args)
 
-    state = state = proj.factory.call_state(func_addr, idx)
-    block = proj.factory.block(state.addr)
+    # create the dictionary for results
     results = defaultdict(lambda: {
         "spec_insecure": False,
         "non_spec_insecure": False,
@@ -518,7 +506,7 @@ def analyze_case(proj, symbol_info, case_name, SPECULATIVE_WINDOW, check_spec_ct
 
     # assign variables to state globals
     state.globals["case_name"] = case_name
-    state.globals["idx"] = idx
+    state.globals["args"] = args
     state.globals["results"] = results
     state.globals["spec_instr_count"] = 0
     state.globals["mask"] = None
@@ -666,10 +654,15 @@ def print_summary(results, check_spec_ct):
             print(f"   - Normal-execution CT: {'🚨 Insecure' if res['non_spec_insecure'] else '🔒 Secure'}")
         inputs = res.get("inputs")
         if isinstance(inputs, list) and inputs:
-            for i, inp in enumerate(inputs):
-                print(f"     Input {i+1}: {inp}")
-        else:
-            print("     Input: -")
+            for i, input_set in enumerate(inputs):
+                if isinstance(input_set, dict):
+                    for name, value in input_set.items():
+                        print(f"     {name}: {value}")
+                elif isinstance(input_set, list):
+                    for j, value in enumerate(input_set):
+                        print(f"     Input {j+1}: {value}")
+                else:
+                    print(f"     value: {input_set}")
 
     # safely sum times, treating None as 0.0
     total_time = sum((res.get("Time") or 0.0) for res in results.values())
@@ -750,8 +743,6 @@ def write_results(binary_label, binary_path, results, spec_ct_enabled):
 
         writer.writerow(summary_row)
 
-        
-
 def main():
     global proj
     
@@ -790,7 +781,7 @@ def main():
 
     proj = angr.Project(binary_path, auto_load_libs=False)
     CTMemory._set_memsight_ranges(proj)
-    symbol_info = parse_config(proj, cfg)
+    symbol_info, args_map = parse_config(proj, cfg)
     case_names  = get_case_names(proj, specific_case)
     results = {}
 
@@ -800,6 +791,7 @@ def main():
         results[case_name] = analyze_case(
             proj,
             symbol_info,
+            args_map,
             case_name,
             SPECULATIVE_WINDOW,
             check_spec_ct=check_spec_ct
