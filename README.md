@@ -22,4 +22,5 @@ Build the container: "docker buildx build --platform linux/amd64 -t angr-spec --
 To compile a c-file from test_sources run command: gcc -fno-pie -no-pie -O0 -o ../test_binaries/output_binary your_file.c
 ## Testing
 To test a binary, run command: python3 detector.py ./test_binaries/binary_name binary_name_config.json  
-Optionally, you can also specify a particular test case and enable speculative constant-time analysis:   python3 detector.py ./test_binaries/binary_name binary_name_config.json --case_name --spec-ct
+Optionally, you can also specify a particular test case and enable speculative constant-time analysis:  
+python3 detector.py ./test_binaries/binary_name binary_name_config.json --case_name --spec-ct
