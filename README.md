@@ -19,7 +19,7 @@ Enable QEMU emulation: <pre>docker run --rm --privileged tonistiigi/binfmt --ins
 Build the container: <pre>docker buildx build --platform linux/amd64 -t angr-spec --load ."</pre>
 Run the container: <pre> docker run -it --platform=linux/amd64 -v "$(pwd)":/workspace -w /workspace angr-spec</pre>
 ## Compiling 
-To compile a c-file from test_sources run command: gcc -fno-pie -no-pie -O0 -o ../test_binaries/output_binary your_file.c
+To compile a c-file from test_sources run command: <pre>gcc -fno-pie -no-pie -O0 -o ../test_binaries/output_binary your_file.c</pre>
 ## Testing
 To test a binary, run command: <pre> python3 detector.py ./test_binaries/binary_name binary_name_config.json</pre>
 Optionally, you can also specify a particular test case and enable speculative constant-time analysis:  
