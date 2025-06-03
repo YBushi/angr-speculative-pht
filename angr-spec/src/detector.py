@@ -154,6 +154,7 @@ def on_branch(state):
     else:
         # if the speculative execution is not enabled, add the constraint right away
         state.globals["solver"].add(pred)
+
     
     # if the condition is not dependent on a secret, we can return
     if not check_secret_dependency(state, cond):
@@ -166,8 +167,8 @@ def on_branch(state):
     for value_ast, in_secret in state.globals["leak_records"]:
         if ast_contains(cond_ast, value_ast):
             break
-    
-    if is_speculative_leak(state, addr):
+
+    if is_speculative_leak(state, addr, True):
         mark_as_leaky(state, addr, True, True, in_secret)
         return
     
@@ -210,9 +211,9 @@ def mem_read(state):
     if addr is None or expr is None:
         return
     
-    # if the address doesn't include a single attacker-controlled argument, return
-    if not any(ast_contains(addr, arg) for arg in state.globals["args"]):
-       return
+    # # if the address doesn't include a single attacker-controlled argument, return
+    # if not any(ast_contains(addr, arg) for arg in state.globals["args"]):
+    #    return
 
     base = state.globals["secretarray_addr"]
     size = state.globals["secretarray_size"]
@@ -236,6 +237,7 @@ def mem_read(state):
 
     # if we have an expression dependent on secret, taint the expression
     if check_secret_dependency(state, expr):
+        state.globals["in_secret"] = in_secret
         taint(state, expr)
         record_leak_pred(state, expr, in_secret)
 
@@ -244,7 +246,7 @@ def mem_read(state):
         return
     
     # check whether the leak has occurred in a spec or non-spec state
-    if is_speculative_leak(state, addr):
+    if is_speculative_leak(state):
         mark_as_leaky(state, addr, is_spec_state=True)
         return
     
@@ -341,7 +343,7 @@ def mark_as_leaky(state, addr, is_spec_state, branch_leak=False, branch_sec=None
     results["addrs"].add(state.addr)
     args = state.globals["args"]
     concrete_inputs = [hex(idx_solver.eval(arg, 1)[0]) for arg in args]
-    results.setdefault("inputs", []).append(concrete_inputs)
+    results["inputs"].append(concrete_inputs)
     raise StopAnalysis()
 
 def taint(state, expr):
@@ -356,12 +358,19 @@ def taint(state, expr):
         if sym is not None and sym not in secret_symbols:
             secret_symbols.add(sym)
 
-def is_speculative_leak(state, addr):
+def is_speculative_leak(state, addr=None, branch_leak=False):
     """Determine whether we are in a speculative state"""
     predicates = state.globals.get("path_predicates", [])
-    in_secret = state.globals["in_secret"]
     solver = state.globals['solver']
-    
+    if not branch_leak: 
+        addr = state.inspect.mem_read_address
+        _ , in_sec = find_record_for_OOB(state, addr)
+    else: 
+        in_sec = state.globals["in_secret"]
+        
+    if in_sec is None:
+            in_sec = True
+
     # get the predicates from the dict
     preds = []
     for entry in predicates:
@@ -374,7 +383,7 @@ def is_speculative_leak(state, addr):
         preds = state.solver.true
 
     # build conjunction of predicates and in_secret predicate
-    extra = preds + ([in_secret] if in_secret is not None else [])
+    extra = preds + ([in_sec] if in_sec is not None else [])
 
     # now ask the solver if we are in a speculative state
     return not solver.satisfiable(extra_constraints=extra)
@@ -647,15 +656,11 @@ def print_summary(results, check_spec_ct):
             print(f"   - Normal-execution CT: {'🚨 Insecure' if res['non_spec_insecure'] else '🔒 Secure'}")
         inputs = res.get("inputs")
         if isinstance(inputs, list) and inputs:
-            for i, input_set in enumerate(inputs):
-                if isinstance(input_set, dict):
-                    for name, value in input_set.items():
-                        print(f"     {name}: {value}")
-                elif isinstance(input_set, list):
-                    for j, value in enumerate(input_set):
-                        print(f"     Input {j+1}: {value}")
-                else:
-                    print(f"     value: {input_set}")
+            for input_set in inputs:
+                for j, val in enumerate(input_set):
+                    print(f"     Input {j+1}: {val}")
+        else:
+            print("     Input: -") 
 
     # safely sum times, treating None as 0.0
     total_time = sum((res.get("Time") or 0.0) for res in results.values())

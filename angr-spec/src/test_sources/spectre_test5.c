@@ -30,16 +30,16 @@ void case_0(uint64_t idx) {
 //CT: Secure | Spec-CT: Insecure
 void case_1(uint64_t idx) {
     if (idx < publicarray_size) {
-        uint8_t v = publicarray[idx];      
-        temp &= publicarray2[v * 512];
+        uint64_t v = idx < publicarray_size ? idx : 0;      
+        temp &= publicarray2[publicarray[v] * 512];
     }
 }
 
 //CT: Insecure | Spec-CT: Insecure
 void case_2(uint64_t idx) {
-    if (idx < secretarray_size) {
-        uint8_t s = secretarray[idx];
-        temp &= publicarray2[s * 512];
+    if (idx < publicarray_size) {
+        uint64_t v = idx;
+        temp &= publicarray2[publicarray[v] * 512];
     }
 }
 

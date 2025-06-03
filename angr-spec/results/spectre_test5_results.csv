@@ -1,3 +1,3 @@
 Binary,Instructions,Time,Non-Speculative Execution,Speculative Execution
-spectre_test5_case_8,21,0.59,Secure,Secure
-summary_spectre_test5,21,0.59,Secure,Secure
+spectre_test5_case_1,12,2.99,Secure,Insecure
+summary_spectre_test5,12,2.99,Secure,Insecure
