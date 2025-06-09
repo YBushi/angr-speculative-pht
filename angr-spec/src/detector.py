@@ -210,10 +210,6 @@ def mem_read(state):
 
     if addr is None or expr is None:
         return
-    
-    # # if the address doesn't include a single attacker-controlled argument, return
-    # if not any(ast_contains(addr, arg) for arg in state.globals["args"]):
-    #    return
 
     base = state.globals["secretarray_addr"]
     size = state.globals["secretarray_size"]
@@ -230,7 +226,7 @@ def mem_read(state):
         return
     
     # check whether this memory read can point to secret memory
-    if solver.satisfiable(extra_constraints=[in_secret]):
+    if any(ast_contains(addr, arg) for arg in state.globals["args"]) and solver.satisfiable(extra_constraints=[in_secret]) :
         state.globals["in_secret"] = in_secret
         taint(state, expr)
         record_leak_pred(state, expr, in_secret)
@@ -448,6 +444,7 @@ def on_instruction(state):
     speculative_instruction_count = state.globals.get("spec_instr_count", 0)
     speculative_instruction_count += 1
     state.globals["spec_instr_count"] = speculative_instruction_count
+    state.globals["unique_instr_addrs"].add(state.addr)
 
     preds = [predicate["pred"] for predicate in predicate_dict if predicate["count"] <= speculative_instruction_count - SPECULATIVE_WINDOW]
     if not preds:
@@ -513,6 +510,7 @@ def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, che
     state.globals["mask"] = None
     state.globals["in_secret"] = None
     state.globals["spec_ct"] = check_spec_ct
+    state.globals["unique_instr_addrs"] = set()
 
     # flags set the same way as in memsightpp
     # add simulation options
@@ -624,23 +622,12 @@ def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, che
         simgr.run()
     except StopAnalysis:
         print("⚠️  Leak detected — aborting simulation early.")
+    end_time = time.time()
     simgr.move('active', 'deadended', lambda s: True)
     # dump_stashes(simgr)
 
-    end_time = time.time()
     results[case_name]["Time"] = end_time - start_time
-
-    # get instruction counts from deadended states
-    counts_dead = [s.globals.get("spec_instr_count", 0) for s in simgr.deadended]
-
-    # collect instruction counts from errored state
-    counts_err  = [e.state.globals.get("spec_instr_count", 0) for e in simgr.errored]
-
-    counts = counts_dead + counts_err
-    if counts:
-        results[case_name]["I"] = max(counts)
-    else:
-        results[case_name]["I"] = 0
+    results[case_name]["I"] = len(state.globals['unique_instr_addrs'])
     return results[case_name]
 
 def print_summary(results, check_spec_ct):
