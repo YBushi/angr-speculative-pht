@@ -161,8 +161,9 @@ def on_branch(state):
         return
     
     # if an OOB access is not possible in the condition, we can return
-    if not is_OOB_possible(state):
-        return
+    if any(ast_contains(cond, arg) for arg in state.globals["args"]):
+        if not is_OOB_possible(state):
+            return
     
     for value_ast, in_secret in state.globals["leak_records"]:
         if ast_contains(cond_ast, value_ast):
