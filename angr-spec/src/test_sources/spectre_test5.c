@@ -61,20 +61,6 @@ void case_4(uint64_t idx) {
             "nop\n\t"  // 4
             "nop\n\t"  // 5
             "nop\n\t"  // 6
-            "nop\n\t"  // 7
-            "nop\n\t"  // 8
-            "nop\n\t"  // 9
-            "nop\n\t"  // 10
-            "nop\n\t"  // 11
-            "nop\n\t"  // 12
-            "nop\n\t"  // 13
-            "nop\n\t"  // 14
-            "nop\n\t"  // 15
-            "nop\n\t"  // 16
-            "nop\n\t"  // 17
-            "nop\n\t"  // 18
-            "nop\n\t"  // 19
-            "nop\n\t"  // 20
         );
         temp &= publicarray2[publicarray[idx] * 512];
     }

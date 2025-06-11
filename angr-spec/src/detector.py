@@ -221,12 +221,8 @@ def mem_read(state):
     in_secret = claripy.And(addr.UGE(lo), addr.ULT(hi))
     solver = state.globals['solver']
 
-    # if OOB access is not possible return
-    if not is_OOB_possible(state):
-        return
-    
     # check whether this memory read can point to secret memory
-    if any(ast_contains(addr, arg) for arg in state.globals["args"]) and solver.satisfiable(extra_constraints=[in_secret]) :
+    if any(ast_contains(addr, arg) for arg in state.globals["args"]) and solver.satisfiable(extra_constraints=[in_secret]):
         state.globals["in_secret"] = in_secret
         taint(state, expr)
         record_leak_pred(state, expr, in_secret)
@@ -287,7 +283,8 @@ def check_secret_dependency(state, expr):
                            state.solver.BVV(0, secret.size()) for secret in secret_symbols}
 
         expr_renamed = expr.replace_dict(renamed_secrets)
-        return state.solver.satisfiable(extra_constraints=[expr != expr_renamed], exact=True)
+        solver = state.globals["solver"]
+        return solver.satisfiable(extra_constraints=[expr != expr_renamed], exact=True)
 
 def on_irsb(state):
     """Ensure the VEX IR Super-Block is decoded and cached"""
@@ -455,13 +452,16 @@ def on_instruction(state):
     This state has passed it's speculative window and has been rolled back
     """
     solver = state.globals['solver']
-    if not solver.satisfiable(extra_constraints=path_cond):     
+    if not solver.satisfiable(extra_constraints=[path_cond]):     
         # path is unsatisfiable, add False to constraints, kill the state! 
         state.add_constraints(claripy.false)
     else:
         # this is the path taken by normal execution
+        preds_to_remove = []
         for pred in preds:
             state.globals["solver"].add(pred)
+            preds_to_remove.append(pred)
+        predicate_dict[:] = [entry for entry in predicate_dict if entry["pred"] not in preds_to_remove]
 
 def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, check_spec_ct = False):
     # run the whole process for every case sequentially
