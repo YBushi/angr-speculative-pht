@@ -96,9 +96,8 @@ def has_branching(addr):
             return True
     return False
 
-def record_branch_count(state):
-    """Record the number of constraints before the conditional branch
-       Save the original exit guard that will then determine which state is speculative
+def record_branch_guard(state):
+    """Save the original exit guard that will then determine which state is speculative
        Mark the current condition as True so we enter the branch
     """
     # get the current condition
@@ -108,7 +107,6 @@ def record_branch_count(state):
         return
     
     state.globals["guard"] = cond
-    state.globals["_pre_branch_count"] = len(state.solver.constraints)
     state.inspect.exit_guard = claripy.BoolV(True)
 
 def on_branch(state):
@@ -119,6 +117,8 @@ def on_branch(state):
     cond = state.globals["guard"]
     cond_ast = state.inspect.exit_guard
     addr = state.addr
+    speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+    print(f"ON BRANCH FIRED AT INSTR COUNT: {speculative_instruction_count}")
 
     speculated_branches = state.globals["speculated_branches"]
     # continue only if the branch wasn't already speculated on
@@ -211,6 +211,8 @@ def mem_read(state):
 
     if addr is None or expr is None:
         return
+    speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+    print(f"MEM FIRED AT INSTR COUNT: {speculative_instruction_count}")
 
     base = state.globals["secretarray_addr"]
     size = state.globals["secretarray_size"]
@@ -440,6 +442,7 @@ def on_instruction(state):
     predicate_dict = state.globals["path_predicates"]
     # increase the instruction count
     speculative_instruction_count = state.globals.get("spec_instr_count", 0)
+    print(f"INSTR COUNT: {speculative_instruction_count}")
     speculative_instruction_count += 1
     state.globals["spec_instr_count"] = speculative_instruction_count
     state.globals["unique_instr_addrs"].add(state.addr)
@@ -460,6 +463,7 @@ def on_instruction(state):
         # this is the path taken by normal execution
         preds_to_remove = []
         for pred in preds:
+            print(f"ADDING A PREDICATE {pred} to committed")
             state.globals["solver"].add(pred)
             preds_to_remove.append(pred)
         predicate_dict[:] = [entry for entry in predicate_dict if entry["pred"] not in preds_to_remove]
@@ -609,7 +613,7 @@ def analyze_case(proj, symbol_info, args_map, case_name, SPECULATIVE_WINDOW, che
     state.solver.timeout = 1000
     
     # hooks
-    state.inspect.b('exit', when=angr.BP_BEFORE, action=record_branch_count) # triggers after branch is resolved
+    state.inspect.b('exit', when=angr.BP_BEFORE, action=record_branch_guard) # triggers before a branch is resolved
     state.inspect.b('exit', when=angr.BP_AFTER, action=on_branch) # triggers after branch is resolved
     state.inspect.b('irsb', when=angr.BP_BEFORE, action=on_irsb) # triggers before basic block execution
     state.inspect.b('mem_read', when=angr.BP_BEFORE, action=mem_read) # triggers before a memory read
@@ -652,7 +656,7 @@ def print_summary(results, check_spec_ct):
 
     # safely sum times, treating None as 0.0
     total_time = sum((res.get("Time") or 0.0) for res in results.values())
-    print(f"⏱️ Total combined analysis time: {total_time:.2f} seconds")
+    print(f"⏱️ Total combined analysis time: {total_time:.3f} seconds")
 
 def dump_stashes(simgr):
     """Debug function for printing all the stashes of the simulation manager"""
@@ -688,7 +692,7 @@ def write_results(binary_label, binary_path, results, spec_ct_enabled):
         for case_name in sorted(results, key=case_key):
             res   = results[case_name]
             I     = res.get("I", 0)
-            t_val = round(res.get("Time", 0), 2)
+            t_val = round(res.get("Time", 0), 3)
 
             total_I    += I if isinstance(I, int) else 0
             total_time += t_val
@@ -719,7 +723,7 @@ def write_results(binary_label, binary_path, results, spec_ct_enabled):
         summary_row = [
             summary_binary,
             total_I,
-            round(total_time, 2),
+            round(total_time, 3),
             summary_non_spec
         ]
 
@@ -751,7 +755,7 @@ def main():
     parser.add_argument(
         "--spec-ct",
         action="store_true",
-        help="also check normal (in-order) constant-time violations, not just speculative"
+        help="check speculative CT violations"
     )
 
     args = parser.parse_args()
